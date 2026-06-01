@@ -1,0 +1,11 @@
+setuptools
+azureml-core
+azureml-mlflow
+mlflow<3
+scikit-learn
+xgboost
+shap
+matplotlib
+pandas
+numpy
+pyodbc

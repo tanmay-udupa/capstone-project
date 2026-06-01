@@ -1,0 +1,3 @@
+# Place xgb_best_model.pkl here before starting the server.
+# Copy from the capstone repo root:
+#   cp ../xgb_best_model.pkl ./models/xgb_best_model.pkl
