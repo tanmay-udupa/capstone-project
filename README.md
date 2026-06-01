@@ -90,5 +90,8 @@ pip install -r requirements.txt
 Copy-Item ..\training\xgb_best_model.pkl models\
 
 # Run the server
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# View API Documentation
+http://localhost:8000/docs#
 ```
