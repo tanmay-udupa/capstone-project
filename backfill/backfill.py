@@ -19,7 +19,7 @@ PAT = os.environ["ADO_PAT"]
 RUNS_CONTAINER = "pipeline-runs-raw"
 
 SQL_SERVER = "capstone-sqlserver.database.windows.net"
-SQL_DB = "pipelinedb"
+SQL_DB = "pipelinedb-dev"
 SQL_USER = "sqladmin"
 SQL_PASSWORD = os.environ["SQL_PASSWORD"]
 
