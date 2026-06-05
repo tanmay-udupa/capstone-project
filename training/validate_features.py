@@ -24,29 +24,29 @@ corr = df[duration_cols].corrwith(df['total_duration_seconds']).sort_values(asce
 print("\n=== Feature correlation with total_duration_seconds ===")
 print(corr)
 
-# 6. Flag low-signal features
+# 5. Flag low-signal features
 print("\n=== Low-signal features (|correlation| < 0.05) ===")
 low_signal = corr[corr.abs() < 0.05].index.tolist()
 print(low_signal)
 
-# 7. Check parallelism_ratio distribution
+# 6. Check parallelism_ratio distribution
 if 'parallelism_ratio' in df.columns:
     print("\n=== parallelism_ratio percentiles ===")
     print(df['parallelism_ratio'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]))
     parallel_pct = (df['parallelism_ratio'] > 1.0).mean() * 100
     print(f"{parallel_pct:.1f}% of runs have parallel execution (ratio > 1.0)")
 
-# 8. Breakdown by pipeline result
+# 7. Breakdown by pipeline result
 print("\n=== Avg total_duration_seconds by result ===")
 print(df.groupby(['result_failed', 'result_partial'])['total_duration_seconds'].mean())
 
-# 9. Security scan overhead
+# 8. Security scan overhead
 if 'security_scan_seconds' in df.columns:
     scan_pct = df['security_scan_seconds'] / df['total_duration_seconds'].replace(0, 1) * 100
     print(f"\n=== Security scan as % of total duration ===")
     print(scan_pct.describe())
 
-# 5. Bar chart of average time buckets
+# 9. Bar chart of average time buckets
 buckets = ['dependency_restore_seconds', 'download_seconds',
            'compile_seconds', 'restore_task_seconds',
            'build_task_seconds', 'test_task_seconds']

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
 
 import numpy as np
@@ -21,10 +20,12 @@ def get_model() -> object:
         if not path.exists():
             raise RuntimeError(
                 f"Model not found at {path}. "
-                "Copy xgb_best_model.pkl from the capstone repo root into backend/models/."
+                "Copy xgb_best_model.ubj from the training output into backend/models/."
             )
-        with open(path, "rb") as f:
-            _MODEL = pickle.load(f)
+        from xgboost import XGBRegressor
+        _m = XGBRegressor()
+        _m.load_model(str(path))
+        _MODEL = _m
     return _MODEL
 
 

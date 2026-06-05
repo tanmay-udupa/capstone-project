@@ -1,5 +1,5 @@
-import pickle
 import pandas as pd
+from xgboost import XGBRegressor
 from azureml.core import Workspace, Model
 
 # ── Connect ────────────────────────────────────────────────────────────────────
@@ -7,8 +7,8 @@ ws = Workspace.from_config()
 print(f"Connected: {ws.name}")
 
 # ── Load artefacts ─────────────────────────────────────────────────────────────
-with open("xgb_best_model.pkl", "rb") as f:
-    model = pickle.load(f)
+model = XGBRegressor()
+model.load_model("xgb_best_model.ubj")
 
 importance_df = pd.read_csv("shap_feature_importance.csv")
 top_feature   = str(importance_df.iloc[0]["feature"])
@@ -21,7 +21,7 @@ training_rows = len(X_train)
 # ── Register ───────────────────────────────────────────────────────────────────
 registered = Model.register(
     workspace   = ws,
-    model_path  = "xgb_best_model.pkl",
+    model_path  = "xgb_best_model.ubj",
     model_name  = "pipeline-advisor-xgb",
     description = (
         "XGBoost post-run explanation model for CI/CD pipeline duration. "

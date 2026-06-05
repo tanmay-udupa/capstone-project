@@ -10,7 +10,7 @@ venv/
 .env
 
 # Model artifacts (regenerated via training)
-*.pkl
+*.ubj
 
 # Data files (regenerated via feature extraction / training)
 *.csv
@@ -22,3 +22,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+phase_breakdown.png

@@ -1,8 +1,8 @@
-import pickle
 import numpy as np
 import pandas as pd
 import mlflow
 import mlflow.xgboost
+import shap
 import tempfile
 from pathlib import Path
 
@@ -94,6 +94,20 @@ with mlflow.start_run(run_name="xgboost-tuned-best"):
     mlflow.log_metric("r2_log_scale", r2_log)
     safe_log_xgb_model(best)
 
-with open("xgb_best_model.pkl", "wb") as f:
-    pickle.dump(best, f)
-print("\nSaved xgb_best_model.pkl  (used by shap_analysis.py and register_model.py)")
+best.save_model("xgb_best_model.ubj")
+print("\nSaved xgb_best_model.ubj  (XGBoost native format — used by register_model.py)")
+
+# ── SHAP feature importance ────────────────────────────────────────────────────
+print("\nComputing SHAP values …")
+explainer   = shap.TreeExplainer(best)
+shap_values = explainer.shap_values(X_train)  # shape: (n_samples, n_features)
+
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+importance_df = (
+    pd.DataFrame({"feature": X_train.columns, "mean_abs_shap": mean_abs_shap})
+    .sort_values("mean_abs_shap", ascending=False)
+    .reset_index(drop=True)
+)
+importance_df.to_csv("shap_feature_importance.csv", index=False)
+print(f"Saved shap_feature_importance.csv  ({len(importance_df)} features)")
+print(importance_df.head(10).to_string(index=False))

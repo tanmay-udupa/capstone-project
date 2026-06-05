@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     # ── Model artefacts ───────────────────────────────────────────────────────
     # Place xgb_best_model.pkl from the capstone repo into models/
-    MODEL_PATH:                   str = "models/xgb_best_model.pkl"
+    MODEL_PATH:                   str = "models/xgb_best_model.ubj"
     # Bump MODEL_VERSION whenever you re-register / retrain
     MODEL_VERSION:                str = "1"
 

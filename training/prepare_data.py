@@ -9,6 +9,9 @@ df["has_test_results"] = (df["total_tests"].fillna(0) > 0).astype(int)
 
 df["test_pass_rate"] = df["test_pass_rate"].fillna(1.0)
 
+# Capture pipeline group labels before dropping identifier columns
+pipeline_groups = df["PipelineName"].reset_index(drop=True)
+
 DROP_COLS = ["RunId", "ProjectName", "PipelineName"]
 df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
@@ -24,8 +27,6 @@ print(f"\nTarget (raw): {TARGET_RAW}   Target (log): {TARGET_LOG}")
 X = df[FEATURES]
 y_log = df[TARGET_LOG]
 y_raw = df[TARGET_RAW]
-
-pipeline_groups = pd.read_csv("pipeline_features.csv")["PipelineName"]
 
 gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
 train_idx, test_idx = next(gss.split(X, y_log, groups=pipeline_groups))
