@@ -1,0 +1,73 @@
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-toolbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: linear-gradient(135deg, #1a237e 0%, #283593 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.app-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-left: 8px;
+  letter-spacing: -0.02em;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.user-btn {
+  color: white;
+  text-transform: none;
+  .user-name {
+    margin-left: 6px;
+    font-weight: 400;
+  }
+}
+
+.user-menu-header {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  small {
+    color: #666;
+    font-size: 0.8rem;
+  }
+}
+
+.app-sidenav-container {
+  flex: 1;
+  margin-top: 64px;
+}
+
+.app-sidenav {
+  width: 240px;
+  border-right: 1px solid rgba(0, 0, 0, 0.06);
+  background: #fafbfc;
+  padding-top: 8px;
+}
+
+.active-link {
+  background: rgba(26, 35, 126, 0.08) !important;
+  border-right: 3px solid #1a237e;
+  mat-icon {
+    color: #1a237e;
+  }
+}
+
+.app-content {
+  padding: 32px;
+  background: #f5f7fa;
+  min-height: calc(100vh - 64px);
+}

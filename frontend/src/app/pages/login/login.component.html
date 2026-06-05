@@ -1,0 +1,43 @@
+<div class="login-page">
+  <div class="login-container">
+    <div class="login-branding">
+      <mat-icon class="brand-icon">insights</mat-icon>
+      <h1>Pipeline Analyser</h1>
+      <p class="tagline">AI-powered CI/CD pipeline optimization</p>
+    </div>
+
+    <mat-card class="login-card" appearance="outlined">
+      <mat-card-content>
+        <div class="login-content">
+          <h2>Welcome</h2>
+          <p>Sign in with your Microsoft account to analyze and optimize your Azure DevOps pipelines.</p>
+
+          <button mat-raised-button color="primary" class="login-btn" (click)="login()">
+            <svg class="ms-icon" viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg">
+              <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+              <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+              <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+              <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+            </svg>
+            Sign in with Microsoft
+          </button>
+
+          <div class="login-features">
+            <div class="feature">
+              <mat-icon>speed</mat-icon>
+              <span>Performance insights powered by XGBoost + SHAP</span>
+            </div>
+            <div class="feature">
+              <mat-icon>trending_up</mat-icon>
+              <span>Benchmark against your best pipeline runs</span>
+            </div>
+            <div class="feature">
+              <mat-icon>lightbulb</mat-icon>
+              <span>Actionable recommendations to reduce build times</span>
+            </div>
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>

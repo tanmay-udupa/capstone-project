@@ -1,0 +1,90 @@
+<div class="dashboard">
+  <div class="dashboard-header">
+    <h1 class="section-title">Dashboard</h1>
+    <p class="section-subtitle">Monitor system health and start new pipeline analyses</p>
+  </div>
+
+  <!-- Loading -->
+  <div class="loading-container" *ngIf="loading">
+    <mat-spinner diameter="40"></mat-spinner>
+    <span>Connecting to API...</span>
+  </div>
+
+  <!-- Error -->
+  <mat-card class="error-card" *ngIf="error && !loading" appearance="outlined">
+    <mat-card-content>
+      <mat-icon class="error-icon">cloud_off</mat-icon>
+      <h3>Connection Error</h3>
+      <p>{{ error }}</p>
+      <button mat-raised-button color="primary" (click)="loadHealth()">
+        <mat-icon>refresh</mat-icon>
+        Retry
+      </button>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Dashboard Content -->
+  <div class="dashboard-content" *ngIf="health && !loading">
+    <!-- Status Cards -->
+    <div class="card-grid">
+      <mat-card class="status-card" appearance="outlined">
+        <mat-card-content>
+          <div class="status-card-header">
+            <mat-icon class="status-icon" [class]="getStatusClass(health.status)">
+              {{ health.status === 'ready' ? 'check_circle' : 'warning' }}
+            </mat-icon>
+            <span class="status-chip" [class]="getStatusClass(health.status)">
+              {{ health.status }}
+            </span>
+          </div>
+          <h3>System Status</h3>
+          <p>API and all services are operational</p>
+        </mat-card-content>
+      </mat-card>
+
+      <mat-card class="status-card" appearance="outlined">
+        <mat-card-content>
+          <div class="status-card-header">
+            <mat-icon class="status-icon" [class.success]="health.model_loaded" [class.error]="!health.model_loaded">
+              {{ health.model_loaded ? 'psychology' : 'psychology_alt' }}
+            </mat-icon>
+            <span class="status-chip" [class.success]="health.model_loaded" [class.error]="!health.model_loaded">
+              {{ health.model_loaded ? 'loaded' : 'unavailable' }}
+            </span>
+          </div>
+          <h3>ML Model</h3>
+          <p>XGBoost + SHAP inference engine</p>
+        </mat-card-content>
+      </mat-card>
+
+      <mat-card class="status-card" appearance="outlined">
+        <mat-card-content>
+          <div class="status-card-header">
+            <mat-icon class="status-icon" [class.success]="health.db_reachable" [class.error]="!health.db_reachable">
+              {{ health.db_reachable ? 'storage' : 'storage' }}
+            </mat-icon>
+            <span class="status-chip" [class.success]="health.db_reachable" [class.error]="!health.db_reachable">
+              {{ health.db_reachable ? 'connected' : 'disconnected' }}
+            </span>
+          </div>
+          <h3>Database</h3>
+          <p>Azure SQL connection pool</p>
+        </mat-card-content>
+      </mat-card>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="quick-actions">
+      <h2>Quick Actions</h2>
+      <div class="actions-grid">
+        <mat-card class="action-card" appearance="outlined" (click)="navigateToAnalyze()">
+          <mat-card-content>
+            <mat-icon>science</mat-icon>
+            <h3>New Analysis</h3>
+            <p>Analyze a pipeline run for optimization opportunities</p>
+          </mat-card-content>
+        </mat-card>
+      </div>
+    </div>
+  </div>
+</div>

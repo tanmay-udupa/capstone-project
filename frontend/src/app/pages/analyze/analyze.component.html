@@ -1,0 +1,149 @@
+<div class="analyze-page">
+  <div class="page-header">
+    <h1 class="section-title">Analyze Pipeline Run</h1>
+    <p class="section-subtitle">
+      Select an organization, project, pipeline, and run to analyze for optimization opportunities.
+    </p>
+  </div>
+
+  <!-- Selection Panel -->
+  <mat-card class="selection-card" appearance="outlined">
+    <mat-card-content>
+      <div class="selectors">
+        <!-- Organization -->
+        <mat-form-field appearance="outline" class="selector">
+          <mat-label>Organization</mat-label>
+          <mat-select
+            [(ngModel)]="selectedOrg"
+            (selectionChange)="onOrgChange()"
+            [disabled]="loadingOrgs">
+            <mat-option *ngFor="let org of organizations" [value]="org.name">
+              {{ org.name }}
+            </mat-option>
+          </mat-select>
+          <mat-icon matSuffix *ngIf="loadingOrgs">
+            <mat-spinner diameter="20"></mat-spinner>
+          </mat-icon>
+        </mat-form-field>
+
+        <!-- Project -->
+        <mat-form-field appearance="outline" class="selector">
+          <mat-label>Project</mat-label>
+          <mat-select
+            [(ngModel)]="selectedProject"
+            (selectionChange)="onProjectChange()"
+            [disabled]="!selectedOrg || loadingProjects">
+            <mat-option *ngFor="let project of projects" [value]="project.name">
+              {{ project.name }}
+            </mat-option>
+          </mat-select>
+          <mat-icon matSuffix *ngIf="loadingProjects">
+            <mat-spinner diameter="20"></mat-spinner>
+          </mat-icon>
+        </mat-form-field>
+
+        <!-- Pipeline -->
+        <mat-form-field appearance="outline" class="selector">
+          <mat-label>Pipeline</mat-label>
+          <mat-select
+            [(ngModel)]="selectedPipeline"
+            (selectionChange)="onPipelineChange()"
+            [disabled]="!selectedProject || loadingPipelines">
+            <mat-option *ngFor="let pipeline of pipelines" [value]="pipeline.id">
+              {{ pipeline.name }}
+            </mat-option>
+          </mat-select>
+          <mat-icon matSuffix *ngIf="loadingPipelines">
+            <mat-spinner diameter="20"></mat-spinner>
+          </mat-icon>
+        </mat-form-field>
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Runs Table -->
+  <mat-card class="runs-card" appearance="outlined" *ngIf="selectedPipeline">
+    <mat-card-header>
+      <mat-card-title>Pipeline Runs</mat-card-title>
+      <mat-card-subtitle>Select a run to analyze</mat-card-subtitle>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="loading-container" *ngIf="loadingRuns">
+        <mat-spinner diameter="32"></mat-spinner>
+        <span>Loading runs...</span>
+      </div>
+
+      <div class="empty-state" *ngIf="!loadingRuns && runs.length === 0">
+        <mat-icon>inbox</mat-icon>
+        <p>No runs found for this pipeline</p>
+      </div>
+
+      <table mat-table [dataSource]="runs" *ngIf="!loadingRuns && runs.length > 0" class="runs-table">
+        <!-- ID -->
+        <ng-container matColumnDef="id">
+          <th mat-header-cell *matHeaderCellDef>Run ID</th>
+          <td mat-cell *matCellDef="let run">#{{ run.id }}</td>
+        </ng-container>
+
+        <!-- Name -->
+        <ng-container matColumnDef="name">
+          <th mat-header-cell *matHeaderCellDef>Name</th>
+          <td mat-cell *matCellDef="let run" class="run-name">{{ run.name }}</td>
+        </ng-container>
+
+        <!-- State -->
+        <ng-container matColumnDef="state">
+          <th mat-header-cell *matHeaderCellDef>State</th>
+          <td mat-cell *matCellDef="let run">
+            <span class="status-chip info">{{ run.state }}</span>
+          </td>
+        </ng-container>
+
+        <!-- Result -->
+        <ng-container matColumnDef="result">
+          <th mat-header-cell *matHeaderCellDef>Result</th>
+          <td mat-cell *matCellDef="let run">
+            <span class="status-chip" [class]="getResultClass(run.result)" *ngIf="run.result">
+              {{ run.result }}
+            </span>
+            <span *ngIf="!run.result" class="no-result">—</span>
+          </td>
+        </ng-container>
+
+        <!-- Duration -->
+        <ng-container matColumnDef="duration">
+          <th mat-header-cell *matHeaderCellDef>Duration</th>
+          <td mat-cell *matCellDef="let run">{{ formatDuration(run.duration_seconds) }}</td>
+        </ng-container>
+
+        <!-- Created -->
+        <ng-container matColumnDef="created">
+          <th mat-header-cell *matHeaderCellDef>Created</th>
+          <td mat-cell *matCellDef="let run">
+            {{ run.created_date ? (run.created_date | date:'short') : '—' }}
+          </td>
+        </ng-container>
+
+        <!-- Actions -->
+        <ng-container matColumnDef="actions">
+          <th mat-header-cell *matHeaderCellDef></th>
+          <td mat-cell *matCellDef="let run">
+            <button
+              mat-raised-button
+              color="primary"
+              [disabled]="analyzingRunId === run.id || run.state !== 'completed'"
+              (click)="analyzeRun(run)"
+              [matTooltip]="run.state !== 'completed' ? 'Run must be completed' : 'Analyze this run'">
+              <mat-spinner diameter="16" *ngIf="analyzingRunId === run.id"></mat-spinner>
+              <mat-icon *ngIf="analyzingRunId !== run.id">science</mat-icon>
+              <span>{{ analyzingRunId === run.id ? 'Analyzing...' : 'Analyze' }}</span>
+            </button>
+          </td>
+        </ng-container>
+
+        <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
+        <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+      </table>
+    </mat-card-content>
+  </mat-card>
+</div>

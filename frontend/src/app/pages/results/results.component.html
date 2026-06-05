@@ -1,0 +1,135 @@
+<div class="results-page">
+  <!-- Back navigation -->
+  <div class="nav-bar">
+    <button mat-button (click)="goBack()">
+      <mat-icon>arrow_back</mat-icon>
+      Back to Analyze
+    </button>
+    <span class="analysis-id">Analysis #{{ analysisId }}</span>
+  </div>
+
+  <!-- Loading State -->
+  <div class="loading-state" *ngIf="loading">
+    <mat-card class="loading-card" appearance="outlined">
+      <mat-card-content>
+        <mat-spinner diameter="48"></mat-spinner>
+        <h2>Analyzing Pipeline Run</h2>
+        <p *ngIf="status === 'pending'">Queued — waiting for processing slot...</p>
+        <p *ngIf="status === 'running'">Running XGBoost inference and SHAP analysis...</p>
+        <mat-progress-bar mode="indeterminate" class="progress-bar"></mat-progress-bar>
+        <div class="status-steps">
+          <div class="step" [class.active]="status === 'pending' || status === 'running'">
+            <mat-icon>check_circle</mat-icon> Fetching run data
+          </div>
+          <div class="step" [class.active]="status === 'running'">
+            <mat-icon>{{ status === 'running' ? 'hourglass_top' : 'radio_button_unchecked' }}</mat-icon>
+            Running ML inference
+          </div>
+          <div class="step">
+            <mat-icon>radio_button_unchecked</mat-icon> Generating recommendations
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </div>
+
+  <!-- Error State -->
+  <mat-card class="error-card" *ngIf="error && !loading" appearance="outlined">
+    <mat-card-content>
+      <mat-icon>error_outline</mat-icon>
+      <h2>Analysis Failed</h2>
+      <p>{{ error }}</p>
+      <div class="error-actions">
+        <button mat-raised-button color="primary" (click)="goBack()">
+          Try Another Run
+        </button>
+        <button mat-button (click)="goToDashboard()">
+          Go to Dashboard
+        </button>
+      </div>
+    </mat-card-content>
+  </mat-card>
+
+  <!-- Results -->
+  <div class="results-content" *ngIf="result && !loading && !error">
+    <!-- Decision Summary -->
+    <mat-card class="summary-card" appearance="outlined" *ngIf="result.decision_summary">
+      <mat-card-content>
+        <div class="summary-header">
+          <div class="summary-icon-container" [class]="getActionabilityClass(result.decision_summary.actionability)">
+            <mat-icon>
+              {{ result.decision_summary.actionability === 'high' ? 'rocket_launch' :
+                 result.decision_summary.actionability === 'medium' ? 'trending_up' : 'check_circle' }}
+            </mat-icon>
+          </div>
+          <div class="summary-text">
+            <h2>{{ result.decision_summary.message }}</h2>
+            <span class="status-chip" [class]="getActionabilityClass(result.decision_summary.actionability)">
+              {{ result.decision_summary.actionability }} actionability
+            </span>
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- Recommendations -->
+    <div class="recommendations-section" *ngIf="result.recommendations && result.recommendations.length > 0">
+      <h2 class="section-title">
+        <mat-icon>lightbulb</mat-icon>
+        Recommendations
+      </h2>
+
+      <div class="recommendations-list">
+        <mat-card
+          *ngFor="let rec of result.recommendations; let i = index"
+          class="rec-card"
+          appearance="outlined">
+          <mat-card-content>
+            <div class="rec-header">
+              <div class="rec-number">{{ i + 1 }}</div>
+              <div class="rec-title-area">
+                <h3>{{ rec.title }}</h3>
+                <div class="rec-meta">
+                  <span class="status-chip" [class]="getPriorityClass(rec.priority)">
+                    {{ rec.priority }} priority
+                  </span>
+                  <span class="confidence-badge">
+                    {{ getConfidencePercent(rec.confidence) }}% confidence
+                  </span>
+                </div>
+              </div>
+              <div class="rec-savings">
+                <span class="savings-value">{{ formatDuration(rec.estimated_savings_seconds) }}</span>
+                <span class="savings-label">potential savings</span>
+                <span class="savings-pct">{{ rec.estimated_savings_pct_of_run | number:'1.0-1' }}% of run</span>
+              </div>
+            </div>
+            <mat-divider></mat-divider>
+            <p class="rec-description">{{ rec.description }}</p>
+            <div class="rec-footer">
+              <div class="rec-tags">
+                <span class="tag" *ngFor="let code of rec.reason_codes">{{ code }}</span>
+              </div>
+              <div class="savings-bar-container">
+                <div class="savings-bar-label">Phase impact: {{ rec.estimated_savings_pct_of_phase | number:'1.0-1' }}%</div>
+                <div class="savings-bar">
+                  <div class="savings-bar-fill" [style.width.%]="rec.estimated_savings_pct_of_phase"></div>
+                </div>
+              </div>
+            </div>
+          </mat-card-content>
+        </mat-card>
+      </div>
+    </div>
+
+    <!-- No Recommendations -->
+    <mat-card class="empty-rec-card" appearance="outlined"
+      *ngIf="result.recommendations && result.recommendations.length === 0">
+      <mat-card-content>
+        <mat-icon>thumb_up</mat-icon>
+        <h3>No Optimization Opportunities</h3>
+        <p>This pipeline run is performing well. No significant improvements detected.</p>
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>

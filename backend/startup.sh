@@ -8,9 +8,9 @@ echo "==> Installing Python dependencies..."
 pip install --no-cache-dir -r requirements.txt
 
 echo "==> Copying model artefact if not present..."
-if [ ! -f models/xgb_best_model.pkl ]; then
-  echo "ERROR: models/xgb_best_model.pkl not found."
-  echo "Copy xgb_best_model.pkl from the capstone repo root into backend/models/"
+if [ ! -f models/xgb_best_model.ubj ]; then
+  echo "ERROR: models/xgb_best_model.ubj not found."
+  echo "Copy xgb_best_model.ubj from the capstone repo root into backend/models/"
   exit 1
 fi
 

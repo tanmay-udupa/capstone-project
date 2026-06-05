@@ -8,7 +8,16 @@ Backfills Azure DevOps pipeline data, trains an XGBoost model, and serves predic
 backfill/        # Data ingestion from Azure DevOps
 training/        # Feature extraction, model training, and registration
 backend/         # FastAPI inference API
+frontend/        # Angular 18 SPA
 ```
+
+## Live Deployment
+
+| Component | URL |
+|-----------|-----|
+| Frontend  | https://white-sky-0d2e9850f.7.azurestaticapps.net |
+| Backend   | https://capstone-backend-api.azurewebsites.net |
+| API Docs  | https://capstone-backend-api.azurewebsites.net/docs |
 
 ## Getting Started
 
@@ -94,4 +103,12 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 # View API Documentation
 http://localhost:8000/docs#
+```
+
+### Frontend
+
+```powershell
+cd frontend
+npm install
+npm start          # dev server at http://localhost:4200
 ```
