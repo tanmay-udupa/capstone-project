@@ -181,8 +181,10 @@ def compute_benchmark(
     # Per-phase opportunity
     phases: list[PhaseBenchmark] = []
     for phase_label, col in PHASE_FEATURES.items():
-        observed    = observed_features.get(col, 0)
-        target      = phase_targets.get(col, 0)
+        observed = observed_features.get(col, 0)
+        target   = phase_targets.get(col, 0)
+        if target == 0:
+            continue
         opportunity = max(0, observed - target)
         phases.append(PhaseBenchmark(
             phase=phase_label,

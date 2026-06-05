@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -11,28 +12,33 @@ from config import settings
 # ── Module-level singletons ────────────────────────────────────────────────────
 _MODEL:     object | None = None
 _EXPLAINER: object | None = None
+_lock = threading.Lock()
 
 
 def get_model() -> object:
     global _MODEL
     if _MODEL is None:
-        path = Path(settings.MODEL_PATH)
-        if not path.exists():
-            raise RuntimeError(
-                f"Model not found at {path}. "
-                "Copy xgb_best_model.ubj from the training output into backend/models/."
-            )
-        from xgboost import XGBRegressor
-        _m = XGBRegressor()
-        _m.load_model(str(path))
-        _MODEL = _m
+        with _lock:
+            if _MODEL is None:
+                path = Path(settings.MODEL_PATH)
+                if not path.exists():
+                    raise RuntimeError(
+                        f"Model not found at {path}. "
+                        "Copy xgb_best_model.ubj from the training output into backend/models/."
+                    )
+                from xgboost import XGBRegressor
+                _m = XGBRegressor()
+                _m.load_model(str(path))
+                _MODEL = _m
     return _MODEL
 
 
 def get_explainer() -> shap.TreeExplainer:
     global _EXPLAINER
     if _EXPLAINER is None:
-        _EXPLAINER = shap.TreeExplainer(get_model())
+        with _lock:
+            if _EXPLAINER is None:
+                _EXPLAINER = shap.TreeExplainer(get_model())
     return _EXPLAINER
 
 

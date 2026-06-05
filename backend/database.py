@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from datetime import datetime, timezone
 
 import pyodbc
@@ -16,10 +17,76 @@ _CONN_STR = (
     "Encrypt=yes;TrustServerCertificate=no;"
 )
 
+_POOL_SIZE = 5
+_pool: queue.Queue[pyodbc.Connection] = queue.Queue(maxsize=_POOL_SIZE)
 
-def get_conn() -> pyodbc.Connection:
-    """Open a new pyodbc connection. Use as a context manager for auto-commit/close."""
-    return pyodbc.connect(_CONN_STR)
+
+def _make_conn() -> pyodbc.Connection:
+    """Open a fresh pyodbc connection."""
+    return pyodbc.connect(_CONN_STR, autocommit=False)
+
+
+def init_pool() -> None:
+    """Pre-fill the connection pool. Call once at application startup."""
+    for _ in range(_POOL_SIZE):
+        _pool.put_nowait(_make_conn())
+
+
+class _PooledConn:
+    """Context manager that borrows a connection from the pool and returns it on exit.
+
+    Falls back to a transient one-off connection when the pool is exhausted.
+    Replaces broken connections automatically on error.
+    """
+
+    def __enter__(self) -> pyodbc.Connection:
+        try:
+            self._conn = _pool.get(timeout=5)
+            self._transient = False
+        except queue.Empty:
+            # Pool exhausted — open a short-lived connection for this call only.
+            self._conn = _make_conn()
+            self._transient = True
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if exc_type is not None:
+            # Roll back; if the connection is broken, replace it in the pool.
+            try:
+                self._conn.rollback()
+                if not self._transient:
+                    _pool.put_nowait(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                if not self._transient:
+                    try:
+                        _pool.put_nowait(_make_conn())
+                    except Exception:
+                        pass
+            return False
+
+        if not self._transient:
+            try:
+                _pool.put_nowait(self._conn)
+            except queue.Full:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        else:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        return False
+
+
+def get_conn() -> _PooledConn:
+    """Borrow a connection from the pool. Use as a context manager."""
+    return _PooledConn()
 
 
 def ping_db() -> bool:

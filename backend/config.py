@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     SQL_USERNAME: str
     SQL_PASSWORD: str
 
+    # ── Entra ID / Auth ───────────────────────────────────────────────────────
+    TENANT_ID:     str  = ""
+    CLIENT_ID:     str  = ""
+    # Set to True in .env for local dev ONLY — never in production.
+    DEV_SKIP_AUTH: bool = False
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    CORS_ORIGINS: str = ""
+
     # ── Azure DevOps ──────────────────────────────────────────────────────────
     ADO_ORG:      str
     ADO_PAT:      str = ""

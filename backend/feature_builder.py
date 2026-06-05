@@ -457,7 +457,7 @@ def build_features(run_id: int) -> tuple[pd.DataFrame, int]:
 
     # test_pass_rate is NULL when no tests ran — fill with 1.0 (perfect pass)
     # to match the imputation used during training.
-    df["test_pass_rate"] = df["test_pass_rate"].fillna(1.0)
+    df["test_pass_rate"] = df["test_pass_rate"].fillna(1.0).infer_objects(copy=False)
 
     return df[MODEL_FEATURES].copy(), actual_duration
 
@@ -465,7 +465,10 @@ def build_features(run_id: int) -> tuple[pd.DataFrame, int]:
 def get_phase_task_context(run_id: int, top_n_per_phase: int = 3) -> dict[str, list[str]]:
     """Return top task/job/stage titles per phase for LLM grounding."""
     with get_conn() as conn:
-        context_df = pd.read_sql(_PHASE_TASK_CONTEXT_SQL, conn, params=(run_id, top_n_per_phase))
+        cursor = conn.cursor()
+        cursor.execute(_PHASE_TASK_CONTEXT_SQL, (run_id, top_n_per_phase))
+        columns = [col[0] for col in cursor.description]
+        context_df = pd.DataFrame.from_records(cursor.fetchall(), columns=columns)
 
     if context_df.empty:
         return {}
@@ -479,14 +482,72 @@ def get_phase_task_context(run_id: int, top_n_per_phase: int = 3) -> dict[str, l
         duration_seconds = int(row["DurationSeconds"] or 0)
         duration_min = round(duration_seconds / 60.0, 1)
 
-        context_parts = [f"task={task_name}"]
+        # Build label: "Task: X (1.2 min) in Job: Y, Stage: Z"
+        # Duration is always the task duration from PipelineTasks.
+        parts = [f"Task: {task_name} ({duration_min} min)"]
         if job_name:
-            context_parts.append(f"job={job_name}")
+            parts.append(f"Job: {job_name}")
         if stage_name:
-            context_parts.append(f"stage={stage_name}")
+            parts.append(f"Stage: {stage_name}")
 
-        phase_context.setdefault(phase, []).append(
-            f"{' | '.join(context_parts)} ({duration_min} min)"
-        )
+        phase_context.setdefault(phase, []).append(" | ".join(parts))
 
     return phase_context
+
+
+_DUPLICATE_TASKS_SQL = """
+SELECT TaskName, COUNT(*) AS occurrence_count
+FROM PipelineTasks
+WHERE RunId = ?
+  AND TaskName NOT IN ('Initialize job', 'Finalize Job')
+  AND TaskName NOT LIKE 'Pre-job:%'
+  AND TaskName NOT LIKE 'Post-job:%'
+  AND TaskName NOT LIKE 'Microsoft Defender for DevOps%'
+GROUP BY TaskName
+HAVING COUNT(*) > 1
+ORDER BY occurrence_count DESC, TaskName ASC
+OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY
+"""
+
+_SKIPPED_TASKS_SQL = """
+SELECT TOP 5 TaskName, COUNT(*) AS skip_count
+FROM PipelineTasks
+WHERE RunId = ?
+  AND Result = 'skipped'
+  AND TaskName NOT IN ('Initialize job', 'Finalize Job')
+  AND TaskName NOT LIKE 'Pre-job:%'
+  AND TaskName NOT LIKE 'Post-job:%'
+  AND TaskName NOT LIKE 'Microsoft Defender for DevOps%'
+GROUP BY TaskName
+ORDER BY skip_count DESC, TaskName ASC
+"""
+
+
+def get_cross_cutting_task_context(run_id: int) -> dict[str, list[str]]:
+    """
+    Return named task lists for cross-cutting signals so recommendations
+    can cite specific task names rather than just counts.
+
+    Returns a dict with optional keys:
+      "duplicate_tasks": ["Checkout Aveva.Apps (4×)", "npm install (2×)", ...]
+      "skipped_tasks":   ["Deploy to UAT (3×)", "Run E2E Tests (2×)", ...]
+    """
+    result: dict[str, list[str]] = {}
+    with get_conn() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(_DUPLICATE_TASKS_SQL, (run_id,))
+        rows = cursor.fetchall()
+        if rows:
+            result["duplicate_tasks"] = [
+                f"{row[0]} ({row[1]}\u00d7)" for row in rows
+            ]
+
+        cursor.execute(_SKIPPED_TASKS_SQL, (run_id,))
+        rows = cursor.fetchall()
+        if rows:
+            result["skipped_tasks"] = [
+                f"{row[0]} ({row[1]}\u00d7)" for row in rows
+            ]
+
+    return result

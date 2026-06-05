@@ -63,10 +63,10 @@ class AnalyzeRequest(BaseModel):
     run_id:                  int            = Field(..., gt=0)
     benchmark_policy:        BenchmarkPolicy  = BenchmarkPolicy.FRONTIER_P20
     comparison_scope:        ComparisonScope  = ComparisonScope.PIPELINE_FAMILY
-    top_k_recommendations:   int            = Field(default=3, ge=1, le=10)
-    min_confidence:          float          = Field(default=0.55, ge=0.0, le=1.0)
-    min_opportunity_seconds: int            = Field(default=60,  ge=0)
-    min_shap_impact_seconds: int            = Field(default=20,  ge=0)
+    top_k_recommendations:   int            = Field(default=3,    ge=1, le=10)
+    min_confidence:          float          = Field(default=0.10, ge=0.0, le=1.0)
+    min_opportunity_seconds: int            = Field(default=60,   ge=0)
+    min_shap_impact_seconds: int            = Field(default=1,    ge=0)
 
 
 # ── Nested response objects ────────────────────────────────────────────────────

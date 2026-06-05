@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -47,31 +47,40 @@ from schemas import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Pipeline Analyser API",
-    version="1.0.0",
-    description="XGBoost + SHAP-powered CI/CD pipeline optimisation API",
-)
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ── Startup: pre-warm model ───────────────────────────────────────────────────
-@app.on_event("startup")
-async def _startup() -> None:
+# ── Startup / shutdown lifecycle ──────────────────────────────────────────────
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    try:
+        db.init_pool()
+        logger.info("DB connection pool initialised (%d connections).", 5)
+    except Exception as exc:
+        logger.error("DB pool failed to initialise: %s", exc)
     try:
         inference.get_model()
         inference.get_explainer()
         logger.info("Model and SHAP explainer loaded successfully.")
     except Exception as exc:
         logger.error("Model failed to load at startup: %s", exc)
+    yield
+
+
+app = FastAPI(
+    title="Pipeline Analyser API",
+    version="1.0.0",
+    description="XGBoost + SHAP-powered CI/CD pipeline optimisation API",
+    lifespan=_lifespan,
+)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+_cors_origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_origins != ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ── Global error handler ──────────────────────────────────────────────────────
@@ -125,7 +134,7 @@ def _run_analysis(analysis_id: int, req: AnalyzeRequest, raw_token: str) -> None
                 logger.warning("store_run_data not implemented; skipping persistence.")
 
         # Step 3 — Build features
-        features_df, actual_duration, phase_task_context = bm_features = _step_features(req.run_id)
+        features_df, actual_duration, phase_task_context, cross_cutting_context = bm_features = _step_features(req.run_id)
 
         # Step 4 — XGBoost + SHAP
         infer = inference.run_inference(
@@ -168,18 +177,21 @@ def _run_analysis(analysis_id: int, req: AnalyzeRequest, raw_token: str) -> None
 
         # Step 6 — Recommendations
         run_context = {
-            "org":           req.org,
-            "project":       req.project,
-            "pipeline_id":   req.pipeline_id,
-            "run_id":        req.run_id,
-            "pipeline_name": pipeline_name,
-            "phase_task_context": phase_task_context,
+            "org":              req.org,
+            "project":          req.project,
+            "pipeline_id":      req.pipeline_id,
+            "run_id":           req.run_id,
+            "pipeline_name":    pipeline_name,
+            "phase_task_context":     phase_task_context,
+            "cross_cutting_context":  cross_cutting_context,
+            "data_sufficiency": bench.data_sufficiency.value,
         }
         recs = recommender.build_recommendations(
             shap_by_feature=infer["shap_by_feature"],
             benchmark=bench,
             actual_duration=actual_duration,
             run_context=run_context,
+            feature_values=features_df.iloc[0].to_dict(),
             top_k=req.top_k_recommendations,
             min_confidence=req.min_confidence,
             min_opportunity_sec=req.min_opportunity_seconds,
@@ -199,11 +211,12 @@ def _run_analysis(analysis_id: int, req: AnalyzeRequest, raw_token: str) -> None
 
 def _step_features(run_id: int):
     """Thin wrapper so the error message is clear in logs."""
-    from feature_builder import build_features, get_phase_task_context
+    from feature_builder import build_features, get_phase_task_context, get_cross_cutting_task_context
 
     features_df, actual_duration = build_features(run_id)
     phase_task_context = get_phase_task_context(run_id)
-    return features_df, actual_duration, phase_task_context
+    cross_cutting_context = get_cross_cutting_task_context(run_id)
+    return features_df, actual_duration, phase_task_context, cross_cutting_context
 
 
 def _status_from_db(db_status: str) -> AnalysisStatus:
@@ -267,6 +280,8 @@ def _build_result(
     recommendations_out = []
     for idx, r in enumerate(recs, start=1):
         savings_seconds = int(round(float(r.get("opportunity_seconds", 0) or 0)))
+        if actual_dur > 0:
+            savings_seconds = min(savings_seconds, actual_dur)
         observed_phase_seconds = int(round(float(r.get("observed_seconds", 0) or 0)))
 
         pct_of_run_raw = (savings_seconds / actual_dur * 100) if actual_dur > 0 else 0.0
@@ -334,9 +349,17 @@ def _build_result(
 async def create_analysis(
     req:             AnalyzeRequest,
     background_tasks:BackgroundTasks,
+    request:         Request,
+    claims:          dict = Depends(validate_token),
 ) -> AnalyzeResponse:
     """Trigger an async analysis for a pipeline run. Returns analysis_id immediately."""
-    requested_by = "capstone-user"
+    requested_by = (
+        claims.get("preferred_username")
+        or claims.get("upn")
+        or claims.get("sub")
+        or "unknown"
+    )
+    raw_token = getattr(request.state, "raw_token", "")
 
     analysis_id, created_new = db.create_analysis(
         org=req.org,
@@ -348,7 +371,7 @@ async def create_analysis(
     )
 
     if created_new:
-        background_tasks.add_task(_run_analysis, analysis_id, req, "")
+        background_tasks.add_task(_run_analysis, analysis_id, req, raw_token)
 
     existing_status = AnalysisStatus.PENDING
     message = "Analysis queued. Poll GET /v1/analyses/{id} for results."
@@ -369,6 +392,7 @@ async def create_analysis(
 @app.get("/v1/analyses/{analysis_id}", response_model=AnalyzeResponse)
 async def get_analysis(
     analysis_id: int,
+    _claims: dict = Depends(validate_token),
 ) -> AnalyzeResponse:
     """Poll analysis status."""
     row = db.get_analysis(analysis_id)
@@ -398,6 +422,7 @@ async def get_analysis(
 @app.get("/v1/analyses/{analysis_id}/recommendations", response_model=RecommendationsOnly)
 async def get_recommendations(
     analysis_id: int,
+    _claims: dict = Depends(validate_token),
 ) -> RecommendationsOnly:
     """Return only the recommendations from a completed analysis."""
     row = db.get_analysis(analysis_id)
@@ -492,13 +517,16 @@ async def get_recommendations(
 
 @app.get("/v1/ado/organizations", response_model=AdoOrganizationsResponse)
 async def list_organizations(
+    request: Request,
+    _claims: dict = Depends(validate_token),
 ) -> AdoOrganizationsResponse:
     """
     Return all ADO organizations accessible to the authenticated user.
     Frontend calls this first after login to populate the org selector.
     """
+    raw_token = getattr(request.state, "raw_token", "")
     try:
-        orgs = ado_client.list_organizations(user_token="")
+        orgs = ado_client.list_organizations(user_token=raw_token)
     except Exception as exc:
         logger.error("list_organizations failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"ADO API error: {exc}")
@@ -511,13 +539,16 @@ async def list_organizations(
 @app.get("/v1/ado/{org}/projects", response_model=AdoProjectsResponse)
 async def list_projects(
     org:     str,
+    request: Request,
+    _claims: dict = Depends(validate_token),
 ) -> AdoProjectsResponse:
     """
     Return all projects in an organization.
     Frontend calls this when the user clicks an organization.
     """
+    raw_token = getattr(request.state, "raw_token", "")
     try:
-        projects = ado_client.list_projects(org, user_token="")
+        projects = ado_client.list_projects(org, user_token=raw_token)
     except Exception as exc:
         logger.error("list_projects(%s) failed: %s", org, exc)
         raise HTTPException(status_code=502, detail=f"ADO API error: {exc}")
@@ -532,13 +563,16 @@ async def list_projects(
 async def list_pipelines(
     org:     str,
     project: str,
+    request: Request,
+    _claims: dict = Depends(validate_token),
 ) -> AdoPipelinesResponse:
     """
     Return all pipelines in a project.
     Frontend calls this when the user clicks a project.
     """
+    raw_token = getattr(request.state, "raw_token", "")
     try:
-        pipelines = ado_client.list_pipelines(org, project, user_token="")
+        pipelines = ado_client.list_pipelines(org, project, user_token=raw_token)
     except Exception as exc:
         logger.error("list_pipelines(%s/%s) failed: %s", org, project, exc)
         raise HTTPException(status_code=502, detail=f"ADO API error: {exc}")
@@ -555,14 +589,17 @@ async def list_runs(
     org:         str,
     project:     str,
     pipeline_id: int,
-    top:         int  = 50,
+    request:     Request,
+    top:         int  = Query(default=50, ge=1, le=200),
+    _claims:     dict = Depends(validate_token),
 ) -> AdoRunsResponse:
     """
-    Return the most recent runs for a pipeline (default: last 50).
+    Return the most recent runs for a pipeline (default: last 50, max: 200).
     Frontend renders these as rows, each with an Analyze button.
     """
+    raw_token = getattr(request.state, "raw_token", "")
     try:
-        runs = ado_client.list_runs(org, project, pipeline_id, user_token="", top=top)
+        runs = ado_client.list_runs(org, project, pipeline_id, user_token=raw_token, top=top)
     except Exception as exc:
         logger.error("list_runs(%s/%s/%d) failed: %s", org, project, pipeline_id, exc)
         raise HTTPException(status_code=502, detail=f"ADO API error: {exc}")

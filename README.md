@@ -87,7 +87,7 @@ cd backend
 pip install -r requirements.txt
 
 # Place the trained model artifact
-Copy-Item ..\training\xgb_best_model.pkl models\
+Copy-Item ..\training\xgb_best_model.ubj models\
 
 # Run the server
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
