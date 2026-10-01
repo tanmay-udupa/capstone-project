@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 
 from database import get_conn
@@ -55,11 +57,15 @@ PHASE_FEATURES: dict[str, str] = {
     "firewall":      "firewall_overhead_seconds",
 }
 
-# ── Feature extraction SQL — Week 3 logic, single-run variant ─────────────────
-# Parameters (7 × run_id): job WHERE, stage WHERE,
-#   task dup-inner WHERE, task outer WHERE, test WHERE, main WHERE
+# ── Feature extraction SQL — Week 3 logic, one or more runs ─────────────────
+# Single parameter: a JSON array of run IDs, so one query serves one run or a whole baseline.
 _FEATURE_SQL = """
-WITH job_features AS (
+WITH scoped_runs AS (
+    SELECT CAST([value] AS bigint) AS RunId
+    FROM OPENJSON(CAST(? AS nvarchar(max)))
+),
+
+job_features AS (
     SELECT
         RunId,
         COUNT(*)                                                        AS job_count,
@@ -67,7 +73,7 @@ WITH job_features AS (
         MAX(DurationSeconds)                                            AS max_job_duration_seconds,
         AVG(DurationSeconds * 1.0)                                      AS avg_job_duration_seconds
     FROM PipelineJobs
-    WHERE RunId = ?
+    WHERE RunId IN (SELECT RunId FROM scoped_runs)
     GROUP BY RunId
 ),
 
@@ -77,7 +83,7 @@ stage_features AS (
         COUNT(*)                                                        AS stage_count,
         SUM(CASE WHEN Result = 'failed' THEN 1 ELSE 0 END)             AS failed_stage_count
     FROM PipelineStages
-    WHERE RunId = ?
+    WHERE RunId IN (SELECT RunId FROM scoped_runs)
     GROUP BY RunId
 ),
 
@@ -197,10 +203,10 @@ task_features AS (
     LEFT JOIN (
         SELECT RunId, TaskName, COUNT(*) AS dup_count
         FROM   PipelineTasks
-        WHERE  RunId = ?
+        WHERE  RunId IN (SELECT RunId FROM scoped_runs)
         GROUP  BY RunId, TaskName
     ) dup ON pt.RunId = dup.RunId AND pt.TaskName = dup.TaskName
-    WHERE pt.RunId = ?
+    WHERE pt.RunId IN (SELECT RunId FROM scoped_runs)
     GROUP BY pt.RunId
 ),
 
@@ -215,10 +221,12 @@ test_features AS (
              ELSE NULL
         END                                                             AS test_pass_rate
     FROM PipelineTests
-    WHERE RunId = ?
+    WHERE RunId IN (SELECT RunId FROM scoped_runs)
 )
 
 SELECT
+    pr.RunId                                                            AS run_id,
+
     -- Actual duration returned separately — NOT a model input
     pr.TotalDurationSeconds                                             AS total_duration_seconds,
 
@@ -297,12 +305,8 @@ LEFT JOIN stage_features           sf   ON pr.RunId = sf.RunId
 LEFT JOIN task_features            tf   ON pr.RunId = tf.RunId
 LEFT JOIN test_features            tstf ON pr.RunId = tstf.RunId
 LEFT JOIN PipelineTimelineFeatures ptf  ON pr.RunId = ptf.RunId
-WHERE pr.RunId = ?
+WHERE pr.RunId IN (SELECT RunId FROM scoped_runs)
 """
-
-# Number of ? placeholders in _FEATURE_SQL
-# job(1) + stage(1) + task_dup_inner(1) + task_outer(1) + test(1) + main WHERE(1) = 6
-_SQL_PARAMS = 6
 
 
 _PHASE_TASK_CONTEXT_SQL = """
@@ -424,6 +428,12 @@ ORDER BY phase, rn;
 """
 
 
+def build_features_for_runs(run_ids: list[int]) -> pd.DataFrame:
+    """Raw feature rows for several runs in one query: one row per run, including run_id."""
+    with get_conn() as conn:
+        return pd.read_sql(_FEATURE_SQL, conn, params=(json.dumps([int(r) for r in run_ids]),))
+
+
 def build_features(run_id: int) -> tuple[pd.DataFrame, int]:
     """
     Extract features for a single run.
@@ -435,9 +445,7 @@ def build_features(run_id: int) -> tuple[pd.DataFrame, int]:
     Raises:
         ValueError if the run is not found or the feature schema is inconsistent.
     """
-    params = (run_id,) * _SQL_PARAMS
-    with get_conn() as conn:
-        df = pd.read_sql(_FEATURE_SQL, conn, params=params)
+    df = build_features_for_runs([run_id])
 
     if df.empty:
         raise ValueError(
@@ -495,8 +503,13 @@ def get_phase_task_context(run_id: int, top_n_per_phase: int = 3) -> dict[str, l
     return phase_context
 
 
-_DUPLICATE_TASKS_SQL = """
-SELECT TaskName, COUNT(*) AS occurrence_count
+# Every execution after the longest one of the same task in the run counts as repeated.
+_REPEATED_TASKS_SQL = """
+SELECT TOP 5
+       TaskName,
+       COUNT(*)                                                 AS executions,
+       SUM(DurationSeconds) - MAX(DurationSeconds)              AS repeated_seconds,
+       SUM(SUM(DurationSeconds) - MAX(DurationSeconds)) OVER () AS total_repeated_seconds
 FROM PipelineTasks
 WHERE RunId = ?
   AND TaskName NOT IN ('Initialize job', 'Finalize Job')
@@ -505,8 +518,7 @@ WHERE RunId = ?
   AND TaskName NOT LIKE 'Microsoft Defender for DevOps%'
 GROUP BY TaskName
 HAVING COUNT(*) > 1
-ORDER BY occurrence_count DESC, TaskName ASC
-OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY
+ORDER BY repeated_seconds DESC, TaskName ASC
 """
 
 _SKIPPED_TASKS_SQL = """
@@ -523,25 +535,28 @@ ORDER BY skip_count DESC, TaskName ASC
 """
 
 
-def get_cross_cutting_task_context(run_id: int) -> dict[str, list[str]]:
+def get_cross_cutting_task_context(run_id: int) -> dict:
     """
     Return named task lists for cross-cutting signals so recommendations
     can cite specific task names rather than just counts.
 
     Returns a dict with optional keys:
-      "duplicate_tasks": ["Checkout Aveva.Apps (4×)", "npm install (2×)", ...]
-      "skipped_tasks":   ["Deploy to UAT (3×)", "Run E2E Tests (2×)", ...]
+      "repeated_tasks":   ["npm install (4×, 9.5 agent-min repeated)", ...]
+      "repeated_seconds": agent time of all repeated executions in the run
+      "skipped_tasks":    ["Deploy to UAT (3×)", "Run E2E Tests (2×)", ...]
     """
-    result: dict[str, list[str]] = {}
+    result: dict = {}
     with get_conn() as conn:
         cursor = conn.cursor()
 
-        cursor.execute(_DUPLICATE_TASKS_SQL, (run_id,))
+        cursor.execute(_REPEATED_TASKS_SQL, (run_id,))
         rows = cursor.fetchall()
         if rows:
-            result["duplicate_tasks"] = [
-                f"{row[0]} ({row[1]}\u00d7)" for row in rows
+            result["repeated_tasks"] = [
+                f"{row[0]} ({row[1]}\u00d7, {round((row[2] or 0) / 60, 1)} agent-min repeated)"
+                for row in rows
             ]
+            result["repeated_seconds"] = int(rows[0][3] or 0)
 
         cursor.execute(_SKIPPED_TASKS_SQL, (run_id,))
         rows = cursor.fetchall()

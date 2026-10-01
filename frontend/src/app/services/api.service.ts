@@ -1,5 +1,5 @@
 import { Injectable, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { environment } from '../../environments/environment';
 import {
@@ -7,6 +7,8 @@ import {
   AnalyzeResponse,
   AnalysisResult,
   HealthResponse,
+  InsightsResponse,
+  InsightsProjectsResponse,
   AdoOrganizationsResponse,
   AdoProjectsResponse,
   AdoPipelinesResponse,
@@ -33,11 +35,23 @@ export class ApiService {
   }
 
   getAnalysisResult(analysisId: number): Observable<AnalysisResult> {
-    return this.http.get<AnalysisResult>(`${this.baseUrl}/v1/analyses/${analysisId}`);
+    return this.http.get<AnalysisResult>(`${this.baseUrl}/v1/analyses/${analysisId}/result`);
   }
 
   getRecommendations(analysisId: number): Observable<any> {
     return this.http.get(`${this.baseUrl}/v1/analyses/${analysisId}/recommendations`);
+  }
+
+  // Insights
+  getInsights(project?: string, days?: number): Observable<InsightsResponse> {
+    let params = new HttpParams();
+    if (project) params = params.set('project', project);
+    if (days) params = params.set('days', days);
+    return this.http.get<InsightsResponse>(`${this.baseUrl}/v1/insights`, { params });
+  }
+
+  getInsightProjects(): Observable<InsightsProjectsResponse> {
+    return this.http.get<InsightsProjectsResponse>(`${this.baseUrl}/v1/insights/projects`);
   }
 
   // ADO Browsing

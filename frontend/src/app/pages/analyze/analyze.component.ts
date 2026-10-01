@@ -52,10 +52,13 @@ export class AnalyzeComponent implements OnInit {
   projects: AdoProject[] = [];
   pipelines: AdoPipeline[] = [];
   runs: AdoRun[] = [];
+  filteredRuns: AdoRun[] = [];
+  branches: { name: string; count: number }[] = [];
 
   selectedOrg: string = '';
   selectedProject: string = '';
   selectedPipeline: number | null = null;
+  selectedBranch = '';
 
   // Loading states
   loadingOrgs = false;
@@ -65,7 +68,7 @@ export class AnalyzeComponent implements OnInit {
   analyzingRunId: number | null = null;
 
   // Table columns
-  displayedColumns = ['id', 'name', 'state', 'result', 'duration', 'created', 'actions'];
+  displayedColumns = ['id', 'name', 'branch', 'state', 'result', 'duration', 'created', 'actions'];
 
   ngOnInit(): void {
     this.loadOrganizations();
@@ -129,12 +132,17 @@ export class AnalyzeComponent implements OnInit {
 
   onPipelineChange(): void {
     this.runs = [];
+    this.branches = [];
+    this.selectedBranch = '';
+    this.applyBranchFilter();
     if (!this.selectedPipeline) return;
 
     this.loadingRuns = true;
-    this.api.getRuns(this.selectedOrg, this.selectedProject, this.selectedPipeline).subscribe({
+    this.api.getRuns(this.selectedOrg, this.selectedProject, this.selectedPipeline, 200).subscribe({
       next: (res) => {
         this.runs = res.runs;
+        this.branches = this.countBranches(res.runs);
+        this.applyBranchFilter();
         this.loadingRuns = false;
       },
       error: () => {
@@ -142,6 +150,27 @@ export class AnalyzeComponent implements OnInit {
         this.loadingRuns = false;
       },
     });
+  }
+
+  applyBranchFilter(): void {
+    this.filteredRuns = this.selectedBranch
+      ? this.runs.filter((run) => run.branch === this.selectedBranch)
+      : this.runs;
+  }
+
+  branchLabel(branch: string | null): string {
+    if (!branch) return '—';
+    const pullRequest = branch.match(/^refs\/pull\/(\d+)\//);
+    return pullRequest ? `PR #${pullRequest[1]}` : branch.replace(/^refs\/heads\//, '');
+  }
+
+  private countBranches(runs: AdoRun[]): { name: string; count: number }[] {
+    // Runs arrive newest first, so branches are listed by their latest run.
+    const counts = new Map<string, number>();
+    for (const run of runs) {
+      if (run.branch) counts.set(run.branch, (counts.get(run.branch) ?? 0) + 1);
+    }
+    return [...counts].map(([name, count]) => ({ name, count }));
   }
 
   analyzeRun(run: AdoRun): void {

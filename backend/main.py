@@ -12,6 +12,7 @@ import ado_client
 import benchmark as bm
 import database as db
 import inference
+import insights
 import recommender
 from auth import validate_token
 from config import settings
@@ -26,8 +27,11 @@ from schemas import (
     DiagnosisResult,
     ErrorDetail,
     ErrorResponse,
+    FallbackUsed,
     HealthResponse,
-    OpportunityByPhase,
+    InsightsProjectsResponse,
+    InsightsResponse,
+    PhaseComparison,
     Recommendation,
     RecommendationsOnly,
     RunMetrics,
@@ -66,7 +70,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Pipeline Analyser API",
+    title="Pipeline Analyzer API",
     version="1.0.0",
     description="XGBoost + SHAP-powered CI/CD pipeline optimisation API",
     lifespan=_lifespan,
@@ -143,35 +147,24 @@ def _run_analysis(analysis_id: int, req: AnalyzeRequest, raw_token: str) -> None
 
         # Step 5 — Benchmark
         pipeline_name = db.get_pipeline_name(req.run_id)
-        project_name  = db.get_project_name(req.run_id)
-
-        observed_phase = {
-            col: int(features_df[col].iloc[0])
-            for col in PHASE_FEATURES.values()
-            if col in features_df.columns
-        }
+        feature_row   = features_df.iloc[0]
 
         bench = bm.compute_benchmark(
             run_id=req.run_id,
             pipeline_name=pipeline_name,
-            project=project_name,
-            org=req.org,
-            scope=req.comparison_scope,
-            policy=req.benchmark_policy,
-            observed_features=observed_phase,
-            actual_duration=actual_duration,
+            observed_features={col: int(feature_row[col]) for col in PHASE_FEATURES.values()},
+            observed_agent_seconds=int(feature_row["total_timeline_seconds"]),
         )
 
         logger.info(
-            "Benchmark summary: policy=%s scope=%s sample_size=%d sufficiency=%s "
-            "fallback=%s target_total_seconds=%d total_opportunity_seconds=%d phases=%d",
+            "Benchmark summary: policy=%s sample_size=%d sufficiency=%s fallback=%s "
+            "observed_agent_seconds=%d typical_agent_seconds=%d phases=%d",
             bench.policy_used,
-            bench.scope_used,
             bench.sample_size,
             bench.data_sufficiency,
             bench.fallback_used,
-            bench.target_total_seconds,
-            bench.total_opportunity_seconds,
+            bench.observed_agent_seconds,
+            bench.typical_agent_seconds,
             len(bench.phases),
         )
 
@@ -184,23 +177,18 @@ def _run_analysis(analysis_id: int, req: AnalyzeRequest, raw_token: str) -> None
             "pipeline_name":    pipeline_name,
             "phase_task_context":     phase_task_context,
             "cross_cutting_context":  cross_cutting_context,
-            "data_sufficiency": bench.data_sufficiency.value,
+            "baseline_runs":    bench.sample_size,
         }
         recs = recommender.build_recommendations(
-            shap_by_feature=infer["shap_by_feature"],
             benchmark=bench,
-            actual_duration=actual_duration,
             run_context=run_context,
-            feature_values=features_df.iloc[0].to_dict(),
+            feature_values=feature_row.to_dict(),
             top_k=req.top_k_recommendations,
-            min_confidence=req.min_confidence,
             min_opportunity_sec=req.min_opportunity_seconds,
-            min_shap_impact_sec=req.min_shap_impact_seconds,
         )
-        actionability = recommender.compute_actionability(recs)
 
         # Step 7 — Build result and persist
-        result = _build_result(req, actual_duration, infer, bench, recs, actionability)
+        result = _build_result(req, actual_duration, infer, bench, recs)
         result.analysis_id = analysis_id
         db.update_analysis(analysis_id, "complete", result=result.model_dump())
 
@@ -227,13 +215,43 @@ def _status_from_db(db_status: str) -> AnalysisStatus:
     return AnalysisStatus(normalized)
 
 
+def _is_current(analysis: dict) -> bool:
+    """False when an analysis failed or was produced by older benchmark or recommendation rules."""
+    if analysis.get("status") == "failed":
+        return False
+    if analysis.get("status") != "complete":
+        return True
+    versions = (analysis.get("result") or {}).get("versions") or {}
+    return (
+        versions.get("benchmark_policy_version") == bm.BENCHMARK_POLICY_VERSION
+        and versions.get("recommendation_rules_version") == recommender.RECOMMENDATION_RULES_VERSION
+    )
+
+
+def _current_result(analysis_id: int) -> dict:
+    """Stored result of a completed, up-to-date analysis; raises 404 or 409 otherwise."""
+    row = db.get_analysis(analysis_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Analysis {analysis_id} not found.")
+    if row["status"] != "complete":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Analysis is {row['status']}. Try again when status == 'complete'.",
+        )
+    if not _is_current(row):
+        raise HTTPException(
+            status_code=409,
+            detail="This analysis was produced by an earlier version. Analyze the run again to refresh it.",
+        )
+    return row.get("result") or {}
+
+
 def _build_result(
-    req:           AnalyzeRequest,
-    actual_dur:    int,
-    infer:         dict,
-    bench:         bm.BenchmarkOutput,
-    recs:          list[dict],
-    actionability,
+    req:        AnalyzeRequest,
+    actual_dur: int,
+    infer:      dict,
+    bench:      bm.BenchmarkOutput,
+    recs:       list[dict],
 ) -> AnalysisResult:
     run_metrics = RunMetrics(
         actual_duration_seconds=actual_dur,
@@ -257,11 +275,12 @@ def _build_result(
     )
 
     phases_out = [
-        OpportunityByPhase(
+        PhaseComparison(
             phase=p.phase,
             observed_seconds=p.observed_seconds,
-            benchmark_seconds=p.benchmark_seconds,
-            opportunity_seconds=p.opportunity_seconds,
+            typical_seconds=p.typical_seconds,
+            p90_seconds=p.p90_seconds,
+            above_typical_seconds=p.above_typical_seconds,
         )
         for p in bench.phases
     ]
@@ -269,58 +288,42 @@ def _build_result(
     benchmark_out = BenchmarkResult(
         policy_used=bench.policy_used,
         scope_used=bench.scope_used,
-        target_total_seconds=bench.target_total_seconds,
-        total_opportunity_seconds=bench.total_opportunity_seconds,
-        total_opportunity_pct=bench.total_opportunity_pct,
         sample_size=bench.sample_size,
         data_sufficiency=bench.data_sufficiency,
         fallback_used=bench.fallback_used,
+        observed_agent_seconds=bench.observed_agent_seconds,
+        typical_agent_seconds=bench.typical_agent_seconds,
     )
 
-    recommendations_out = []
-    for idx, r in enumerate(recs, start=1):
-        savings_seconds = int(round(float(r.get("opportunity_seconds", 0) or 0)))
-        if actual_dur > 0:
-            savings_seconds = min(savings_seconds, actual_dur)
-        observed_phase_seconds = int(round(float(r.get("observed_seconds", 0) or 0)))
-
-        pct_of_run_raw = (savings_seconds / actual_dur * 100) if actual_dur > 0 else 0.0
-        pct_of_run = round(min(100.0, max(0.0, pct_of_run_raw)), 1)
-        pct_of_phase = (
-            round(min(100.0, max(0.0, savings_seconds / observed_phase_seconds * 100)), 1)
-            if observed_phase_seconds > 0 else 0.0
+    recommendations_out = [
+        Recommendation(
+            id=f"rec-{req.run_id}-{idx}",
+            title=r["title"],
+            description=r["narrative"],
+            reason_codes=[f"phase:{r['phase']}"],
+            figure_seconds=r["figure_seconds"],
+            figure_label=r["figure_label"],
+            share_of_agent_time_pct=r["share_of_agent_time_pct"],
+            observed_seconds=r["observed_seconds"],
+            typical_seconds=r["typical_seconds"],
         )
+        for idx, r in enumerate(recs, start=1)
+    ]
 
-        recommendations_out.append(
-            Recommendation(
-                id=f"rec-{req.run_id}-{idx}",
-                title=r["title"],
-                description=r["narrative"],
-                reason_codes=[f"phase:{r['phase']}"],
-                estimated_savings_seconds=savings_seconds,
-                estimated_savings_pct=pct_of_run,
-                estimated_savings_pct_of_run=pct_of_run,
-                estimated_savings_pct_of_phase=pct_of_phase,
-                confidence=r["confidence"],
-                priority=r["priority"],
-            )
-        )
-
-    summary = DecisionSummary(
-        actionability=actionability,
-        message=(
-            "No strong opportunities detected for this run."
-            if not recommendations_out
-            else f"{len(recommendations_out)} recommendation(s) generated."
-        ),
-    )
+    if recommendations_out:
+        message = f"{len(recommendations_out)} finding(s) for this run."
+    elif bench.fallback_used == FallbackUsed.BENCHMARK_DISABLED:
+        message = "Not enough earlier runs with the same stages to compare this run."
+    else:
+        message = "Nothing unusual: no phase used more agent time than 9 in 10 comparable earlier runs."
+    summary = DecisionSummary(message=message)
 
     versions = Versions(
         api_version="1.0",
         model_version=settings.MODEL_VERSION,
         feature_schema_version="1",
-        benchmark_policy_version="1",
-        recommendation_rules_version="1",
+        benchmark_policy_version=bm.BENCHMARK_POLICY_VERSION,
+        recommendation_rules_version=recommender.RECOMMENDATION_RULES_VERSION,
     )
 
     return AnalysisResult(
@@ -335,7 +338,7 @@ def _build_result(
         run_metrics=run_metrics,
         diagnosis=diagnosis,
         benchmark=benchmark_out,
-        opportunity_by_phase=phases_out,
+        phase_comparison=phases_out,
         recommendations=recommendations_out,
         decision_summary=summary,
         versions=versions,
@@ -370,15 +373,17 @@ async def create_analysis(
         request_payload=req.model_dump(),
     )
 
-    if created_new:
-        background_tasks.add_task(_run_analysis, analysis_id, req, raw_token)
+    existing = None if created_new else db.get_analysis(analysis_id)
+    if existing and not _is_current(existing):
+        db.reset_analysis(analysis_id, requested_by=requested_by, request_payload=req.model_dump())
+        existing = None
 
-    existing_status = AnalysisStatus.PENDING
-    message = "Analysis queued. Poll GET /v1/analyses/{id} for results."
-    if not created_new:
-        existing = db.get_analysis(analysis_id)
-        if existing:
-            existing_status = _status_from_db(existing.get("status") or "pending")
+    if existing is None:
+        background_tasks.add_task(_run_analysis, analysis_id, req, raw_token)
+        existing_status = AnalysisStatus.PENDING
+        message = "Analysis queued. Poll GET /v1/analyses/{id} for results."
+    else:
+        existing_status = _status_from_db(existing.get("status") or "pending")
         message = "Analysis already exists for this run_id. Returning existing analysis."
 
     return AnalyzeResponse(
@@ -425,90 +430,23 @@ async def get_recommendations(
     _claims: dict = Depends(validate_token),
 ) -> RecommendationsOnly:
     """Return only the recommendations from a completed analysis."""
-    row = db.get_analysis(analysis_id)
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Analysis {analysis_id} not found.")
-    if row["status"] != "complete":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Analysis is {row['status']}. Try again when status == 'complete'.",
-        )
-
-    result = row.get("result", {}) or {}
-    recs   = result.get("recommendations", []) or []
-    actual_duration = int((result.get("run_metrics") or {}).get("actual_duration_seconds") or 0)
-    phase_observed_map = {
-        str(p.get("phase")): int(p.get("observed_seconds") or 0)
-        for p in (result.get("opportunity_by_phase") or [])
-        if p.get("phase") is not None
-    }
-
-    mapped_recs: list[Recommendation] = []
-    for idx, r in enumerate(recs, start=1):
-        # Stored recommendations are already Recommendation objects serialized to dicts
-        # with fields: id, title, description, reason_codes, priority, confidence, 
-        # estimated_savings_seconds, estimated_savings_pct
-        mapped_recs.append(
-            Recommendation(
-                id=r.get("id") or f"rec-{analysis_id}-{idx}",
-                title=str(r.get("title") or "Recommendation"),
-                description=str(r.get("description") or ""),
-                reason_codes=r.get("reason_codes") or ["phase:unknown"],
-                priority=str(r.get("priority") or "low"),
-                confidence=float(r.get("confidence") or 0.0),
-                estimated_savings_seconds=int(r.get("estimated_savings_seconds") or 0),
-                estimated_savings_pct=float(
-                    r.get("estimated_savings_pct_of_run")
-                    if r.get("estimated_savings_pct_of_run") is not None
-                    else r.get("estimated_savings_pct")
-                    or 0.0
-                ),
-                estimated_savings_pct_of_run=float(
-                    r.get("estimated_savings_pct_of_run")
-                    if r.get("estimated_savings_pct_of_run") is not None
-                    else r.get("estimated_savings_pct")
-                    or 0.0
-                ),
-                estimated_savings_pct_of_phase=float(
-                    r.get("estimated_savings_pct_of_phase")
-                    if r.get("estimated_savings_pct_of_phase") is not None
-                    else (
-                        round(
-                            min(
-                                100.0,
-                                max(
-                                    0.0,
-                                    (int(r.get("estimated_savings_seconds") or 0)
-                                     / phase_observed_map.get(
-                                         (r.get("reason_codes") or ["phase:unknown"])[0].split(":", 1)[1],
-                                         0,
-                                     )
-                                     * 100),
-                                ),
-                            ),
-                            1,
-                        )
-                        if phase_observed_map.get(
-                            (r.get("reason_codes") or ["phase:unknown"])[0].split(":", 1)[1],
-                            0,
-                        ) > 0
-                        else 0.0
-                    )
-                ),
-            )
-        )
-
-    actionability = (result.get("decision_summary") or {}).get("actionability", "low")
-
+    result = _current_result(analysis_id)
+    summary = result.get("decision_summary")
     return RecommendationsOnly(
         analysis_id=analysis_id,
         status=AnalysisStatus.COMPLETE,
-        recommendations=mapped_recs,
-        decision_summary=DecisionSummary(
-            actionability=actionability,
-            message="Top recommendations for this completed analysis.",
-        ),
+        recommendations=[Recommendation(**r) for r in result.get("recommendations") or []],
+        decision_summary=DecisionSummary(**summary) if summary else None,
     )
+
+
+@app.get("/v1/analyses/{analysis_id}/result", response_model=AnalysisResult)
+async def get_analysis_result(
+    analysis_id: int,
+    _claims: dict = Depends(validate_token),
+) -> AnalysisResult:
+    """Return the full result of a completed analysis, including the per-phase comparison."""
+    return AnalysisResult(**_current_result(analysis_id))
 
 
 # ── ADO browsing endpoints ─────────────────────────────────────────────────────
@@ -610,6 +548,26 @@ async def list_runs(
         pipeline_id=pipeline_id,
         runs=[AdoRun(**r) for r in runs],
     )
+
+
+# ── Insights ───────────────────────────────────────────────────────────────────
+
+# Sync on purpose: FastAPI runs it in a worker thread, so the slow SQL doesn't block the event loop.
+@app.get("/v1/insights", response_model=InsightsResponse)
+def read_insights(
+    project: str | None = Query(default=None, max_length=100),
+    days:    int | None = Query(default=None, ge=1, le=3650),
+    top:     int        = Query(default=10, ge=1, le=50),
+    _claims: dict       = Depends(validate_token),
+) -> InsightsResponse:
+    """Pipeline efficiency across stored runs: where agent time goes and what is worth reviewing."""
+    return InsightsResponse(**insights.get_insights(project=project, days=days, top_n=top))
+
+
+@app.get("/v1/insights/projects", response_model=InsightsProjectsResponse)
+def read_insight_projects(_claims: dict = Depends(validate_token)) -> InsightsProjectsResponse:
+    """Projects with stored runs, for the Pipeline Efficiency project picker."""
+    return InsightsProjectsResponse(projects=insights.get_projects())
 
 
 @app.get("/v1/health", response_model=HealthResponse)

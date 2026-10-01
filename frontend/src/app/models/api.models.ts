@@ -5,12 +5,8 @@ export interface AnalyzeRequest {
   project: string;
   pipeline_id: number;
   run_id: number;
-  benchmark_policy?: string;
-  comparison_scope?: string;
   top_k_recommendations?: number;
-  min_confidence?: number;
   min_opportunity_seconds?: number;
-  min_shap_impact_seconds?: number;
 }
 
 export interface AnalyzeResponse {
@@ -32,12 +28,11 @@ export interface RunMetrics {
 export interface BenchmarkResult {
   policy_used: string;
   scope_used: string;
-  target_total_seconds: number;
-  total_opportunity_seconds: number;
-  total_opportunity_pct: number;
   sample_size: number;
   data_sufficiency: string;
-  fallback_used: string;
+  fallback_used: 'none' | 'benchmark_disabled';
+  observed_agent_seconds: number;
+  typical_agent_seconds: number;
 }
 
 export interface TopContributor {
@@ -51,11 +46,12 @@ export interface DiagnosisResult {
   top_contributors: TopContributor[];
 }
 
-export interface OpportunityByPhase {
+export interface PhaseComparison {
   phase: string;
   observed_seconds: number;
-  benchmark_seconds: number;
-  opportunity_seconds: number;
+  typical_seconds: number;
+  p90_seconds: number;
+  above_typical_seconds: number;
 }
 
 export interface Recommendation {
@@ -63,16 +59,14 @@ export interface Recommendation {
   title: string;
   description: string;
   reason_codes: string[];
-  priority: 'high' | 'medium' | 'low';
-  confidence: number;
-  estimated_savings_seconds: number;
-  estimated_savings_pct: number;
-  estimated_savings_pct_of_run: number;
-  estimated_savings_pct_of_phase: number;
+  figure_seconds: number | null;
+  figure_label: string | null;
+  share_of_agent_time_pct: number | null;
+  observed_seconds: number | null;
+  typical_seconds: number | null;
 }
 
 export interface DecisionSummary {
-  actionability: 'high' | 'medium' | 'low';
   message: string;
 }
 
@@ -101,7 +95,7 @@ export interface AnalysisResult {
   run_metrics?: RunMetrics;
   benchmark?: BenchmarkResult;
   diagnosis?: DiagnosisResult;
-  opportunity_by_phase?: OpportunityByPhase[];
+  phase_comparison?: PhaseComparison[];
   recommendations?: Recommendation[];
   decision_summary?: DecisionSummary;
   versions?: Versions;
@@ -141,6 +135,7 @@ export interface AdoRun {
   created_date: string | null;
   finished_date: string | null;
   duration_seconds: number | null;
+  branch: string | null;
 }
 
 export interface AdoOrganizationsResponse {
@@ -163,4 +158,100 @@ export interface AdoRunsResponse {
   project: string;
   pipeline_id: number;
   runs: AdoRun[];
+}
+
+// Insights (Pipeline Efficiency page)
+export interface InsightsScope {
+  project: string | null;
+  days: number | null;
+  runs: number;
+  pipelines: number;
+  first_run_utc: string | null;
+  last_run_utc: string | null;
+  span_days: number;
+  agent_seconds: number;
+  incomplete_before_utc: string | null;
+  agent_seconds_per_30_days: number | null;
+}
+
+export interface ComputeBreakdown {
+  name: string;
+  runs: number;
+  agent_seconds: number;
+}
+
+export interface RelatedRun {
+  run_id: number;
+  result: string;
+  url: string | null;
+}
+
+export interface ExampleRun {
+  run_id: number;
+  pipeline: string;
+  started_utc: string | null;
+  agent_seconds: number;
+  url: string | null;
+  related: RelatedRun | null;
+}
+
+export interface FailedTaskCount {
+  pipeline: string;
+  task: string;
+  runs: number;
+}
+
+export interface WasteCategory {
+  key: string;
+  title: string;
+  runs: number;
+  agent_seconds: number;
+  likely_avoidable: boolean;
+  fix: string;
+  pipelines: ComputeBreakdown[];
+  examples: ExampleRun[];
+  related_label: string | null;
+  failed_tasks: FailedTaskCount[];
+}
+
+export interface PipelineCompute {
+  pipeline: string;
+  runs: number;
+  agent_seconds: number;
+  failed_or_canceled_seconds: number;
+}
+
+export interface TaskCompute {
+  pipeline: string;
+  task: string;
+  runs: number;
+  occurrences: number;
+  agent_seconds: number;
+}
+
+export interface RepeatedTask {
+  pipeline: string;
+  task: string;
+  runs: number;
+  extra_occurrences: number;
+  repeated_seconds: number;
+}
+
+export interface ProjectOption {
+  name: string;
+  runs: number;
+}
+
+export interface InsightsProjectsResponse {
+  projects: ProjectOption[];
+}
+
+export interface InsightsResponse {
+  scope: InsightsScope;
+  by_outcome: ComputeBreakdown[];
+  by_pool: ComputeBreakdown[];
+  waste: WasteCategory[];
+  top_pipelines: PipelineCompute[];
+  top_tasks: TaskCompute[];
+  repeated_tasks: RepeatedTask[];
 }

@@ -13,6 +13,16 @@ import { MatExpansionModule } from '@angular/material/expansion';
 import { ApiService } from '../../services/api.service';
 import { AnalysisResult, AnalysisStatus } from '../../models';
 
+const PHASE_LABELS: Record<string, string> = {
+  restore: 'Package restore',
+  download: 'Checkout and download',
+  build: 'Build / compile',
+  test: 'Tests',
+  deploy: 'Deploy / publish',
+  security_scan: 'Security scans',
+  firewall: 'Firewall rules',
+};
+
 @Component({
   selector: 'app-results',
   standalone: true,
@@ -76,51 +86,37 @@ export class ResultsComponent implements OnInit, OnDestroy {
   }
 
   loadFullResult(): void {
-    this.api.getRecommendations(this.analysisId).subscribe({
+    this.api.getAnalysisResult(this.analysisId).subscribe({
       next: (res) => {
-        this.result = {
-          analysis_id: this.analysisId,
-          status: 'complete',
-          recommendations: res.recommendations,
-          decision_summary: res.decision_summary,
-        } as AnalysisResult;
+        this.result = res;
         this.loading = false;
       },
-      error: () => {
+      error: (err) => {
         this.loading = false;
-        this.error = 'Failed to load analysis results.';
+        this.error = err?.error?.detail || 'Failed to load analysis results.';
       },
     });
   }
 
-  formatDuration(seconds: number): string {
-    if (!seconds) return '0s';
-    const m = Math.floor(seconds / 60);
-    const s = seconds % 60;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
+  get hasBaseline(): boolean {
+    return this.result?.benchmark?.fallback_used === 'none';
   }
 
-  getPriorityClass(priority: string): string {
-    switch (priority) {
-      case 'high': return 'error';
-      case 'medium': return 'warning';
-      case 'low': return 'info';
-      default: return 'info';
-    }
+  get agentTimeDifference(): number {
+    const benchmark = this.result?.benchmark;
+    return benchmark ? benchmark.observed_agent_seconds - benchmark.typical_agent_seconds : 0;
   }
 
-  getActionabilityClass(actionability: string): string {
-    switch (actionability) {
-      case 'high': return 'success';
-      case 'medium': return 'warning';
-      case 'low': return 'info';
-      default: return 'info';
-    }
+  formatMinutes(seconds: number | null | undefined): string {
+    const totalMinutes = Math.round(Math.abs(seconds ?? 0) / 60);
+    if (totalMinutes < 60) return `${totalMinutes} min`;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes ? `${hours} h ${minutes} min` : `${hours} h`;
   }
 
-  getConfidencePercent(confidence: number): number {
-    return Math.round(confidence * 100);
+  phaseLabel(phase: string): string {
+    return PHASE_LABELS[phase] ?? phase;
   }
 
   goBack(): void {

@@ -5,44 +5,73 @@ from dataclasses import dataclass
 
 from config import settings
 from database import get_conn
-from feature_builder import PHASE_FEATURES
+from feature_builder import PHASE_FEATURES, build_features_for_runs
 from schemas import BenchmarkPolicy, ComparisonScope, DataSufficiency, FallbackUsed
 
 logger = logging.getLogger(__name__)
 
+BENCHMARK_POLICY_VERSION = "3"
+_BASELINE_RUNS = 30
+_MIN_BASELINE_RUNS = 5
+_CANDIDATE_RUNS = 500
+
+# Queue wait happens before an agent is assigned, so it isn't agent time.
+AGENT_TIME_PHASES: dict[str, str] = {
+    phase: column for phase, column in PHASE_FEATURES.items() if phase != "queue"
+}
+
+_RUN_STAGES_SQL = """
+SELECT StageName
+FROM PipelineStages
+WHERE RunId = ?
+  AND Result <> 'skipped'
+"""
+
+# One row per (candidate run, stage it ran); StageName is NULL when the run has no stages recorded.
+_CANDIDATE_STAGES_SQL = """
+WITH candidates AS (
+    SELECT TOP (?) RunId
+    FROM PipelineRuns
+    WHERE PipelineName = ?
+      AND RunId < ?
+      AND Result IN ('succeeded', 'partiallySucceeded')
+      AND FinishTime IS NOT NULL
+    ORDER BY RunId DESC
+)
+SELECT c.RunId, s.StageName
+FROM candidates c
+LEFT JOIN PipelineStages s
+       ON s.RunId = c.RunId
+      AND s.Result <> 'skipped'
+"""
+
 
 @dataclass
 class PhaseBenchmark:
-    phase:               str
-    observed_seconds:    int
-    benchmark_seconds:   int
-    opportunity_seconds: int
+    phase:                 str
+    observed_seconds:      int
+    typical_seconds:       int   # median of the baseline runs
+    p90_seconds:           int   # 9 in 10 baseline runs used no more than this
+    above_typical_seconds: int
+
+    @property
+    def is_unusual(self) -> bool:
+        return self.observed_seconds > self.p90_seconds
 
 
 @dataclass
 class BenchmarkOutput:
-    policy_used:               BenchmarkPolicy
-    scope_used:                ComparisonScope
-    target_total_seconds:      int
-    total_opportunity_seconds: int
-    total_opportunity_pct:     float
-    sample_size:               int
-    data_sufficiency:          DataSufficiency
-    fallback_used:             FallbackUsed
-    phases:                    list[PhaseBenchmark]
+    policy_used:            BenchmarkPolicy
+    scope_used:             ComparisonScope
+    sample_size:            int
+    data_sufficiency:       DataSufficiency
+    fallback_used:          FallbackUsed
+    observed_agent_seconds: int
+    typical_agent_seconds:  int
+    phases:                 list[PhaseBenchmark]
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
-
-def _quantile(policy: BenchmarkPolicy) -> float:
-    return {
-        BenchmarkPolicy.FRONTIER_P10:   0.10,
-        BenchmarkPolicy.FRONTIER_P20:   0.20,
-        BenchmarkPolicy.PERCENTILE_P25: 0.25,
-        BenchmarkPolicy.SLO_ONLY:       0.20,
-        BenchmarkPolicy.HYBRID:         0.20,
-    }.get(policy, 0.20)
-
 
 def _sufficiency(n: int) -> DataSufficiency:
     if n >= settings.BENCHMARK_MIN_SAMPLES_HIGH:
@@ -52,161 +81,81 @@ def _sufficiency(n: int) -> DataSufficiency:
     return DataSufficiency.LOW
 
 
-def _query_benchmark(
-    pipeline_name: str | None,
-    project:       str | None,
-    scope:         ComparisonScope,
-    quantile:      float,
-) -> tuple[int, dict[str, int], int]:
-    """
-    Query PipelineFeaturesMaterialized for benchmark percentiles at the given scope.
-
-    Returns:
-        (sample_size, {phase_col: target_seconds}, target_total_seconds)
-        All zeros when no data is available.
-    """
-    phase_cols = list(PHASE_FEATURES.values())
-
-    # Build scope filter
-    if scope == ComparisonScope.PIPELINE_FAMILY and pipeline_name:
-        where  = "WHERE PipelineName = ?"
-        params: tuple = (pipeline_name,)
-    elif scope == ComparisonScope.PROJECT and project:
-        where  = "WHERE ProjectName = ?"
-        params = (project,)
-    else:
-        where  = ""
-        params = ()
-
-    # Build PERCENTILE_CONT selects for each phase column + total duration
-    phase_selects = "\n        ".join(
-        f"PERCENTILE_CONT({quantile}) WITHIN GROUP (ORDER BY {col})"
-        f" OVER () AS bm_{col},"
-        for col in phase_cols
-    )
-
-    sql = f"""
-    SELECT TOP 1
-        COUNT(*) OVER ()                                                AS sample_size,
-        {phase_selects}
-        PERCENTILE_CONT({quantile}) WITHIN GROUP (ORDER BY total_duration_seconds)
-            OVER ()                                                     AS bm_total_duration
-    FROM PipelineFeaturesMaterialized
-    {where}
-    """
-
+def _comparable_run_ids(run_id: int, pipeline_name: str) -> list[int]:
+    """Most recent earlier completed runs of the pipeline that ran exactly the same stages as this run."""
     with get_conn() as conn:
-        try:
-            row = conn.execute(sql, params).fetchone()
-        except Exception as exc:
-            # Table / view not yet created — cold-start zero
-            logger.warning(
-                "Benchmark query failed for scope=%s pipeline=%s project=%s: %s",
-                scope,
-                pipeline_name,
-                project,
-                exc,
-            )
-            return 0, {col: 0 for col in phase_cols}, 0
+        own_stages = {row[0] for row in conn.execute(_RUN_STAGES_SQL, run_id).fetchall()}
+        rows = conn.execute(_CANDIDATE_STAGES_SQL, _CANDIDATE_RUNS, pipeline_name, run_id).fetchall()
 
-    if not row or int(row[0]) == 0:
-        return 0, {col: 0 for col in phase_cols}, 0
+    stages_by_run: dict[int, set[str]] = {}
+    for candidate_id, stage_name in rows:
+        stages = stages_by_run.setdefault(int(candidate_id), set())
+        if stage_name is not None:
+            stages.add(stage_name)
 
-    sample_size  = int(row[0])
-    target_total = int(row.bm_total_duration or 0)
-    phase_targets = {
-        col: int(getattr(row, f"bm_{col}") or 0)
-        for col in phase_cols
-    }
-    return sample_size, phase_targets, target_total
+    comparable = [rid for rid in sorted(stages_by_run, reverse=True) if stages_by_run[rid] == own_stages]
+    return comparable[:_BASELINE_RUNS]
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def compute_benchmark(
-    run_id:            int,
-    pipeline_name:     str | None,
-    project:           str | None,
-    org:               str | None,
-    scope:             ComparisonScope,
-    policy:            BenchmarkPolicy,
-    observed_features: dict[str, int],   # {feature_col: observed_seconds}
-    actual_duration:   int,
+    run_id:                 int,
+    pipeline_name:          str | None,
+    observed_features:      dict[str, int],   # {feature_col: observed_seconds}
+    observed_agent_seconds: int,
 ) -> BenchmarkOutput:
     """
-    Compute benchmark targets and per-phase opportunity gaps.
+    Compare this run's agent time per phase with up to 30 earlier runs of the same pipeline that
+    ran exactly the same stages and succeeded or partially succeeded.
 
-    Fallback chain (stops at first scope with sufficient data):
-      pipeline_family → project → organization → benchmark_disabled
+    Matching stages keeps runs that skipped a heavy stage (such as security scans) out of the baseline.
+    Both sides come from the same feature query, so phases are defined identically.
+    With fewer than 5 comparable runs the comparison is disabled rather than borrowed from other runs.
     """
-    quantile      = _quantile(policy)
-    current_scope = scope
-    fallback_used = FallbackUsed.NONE
+    baseline_ids = _comparable_run_ids(run_id, pipeline_name) if pipeline_name else []
+    baseline = build_features_for_runs(baseline_ids) if baseline_ids else None
+    if baseline is not None:
+        # A completed run with no agent time means its jobs were never stored.
+        baseline = baseline[baseline["total_timeline_seconds"] > 0]
+    sample_size = 0 if baseline is None else len(baseline)
 
-    fallback_chain = [
-        (scope,                         FallbackUsed.NONE),
-        (ComparisonScope.PROJECT,        FallbackUsed.PIPELINE_TO_PROJECT),
-        (ComparisonScope.ORGANIZATION,   FallbackUsed.PROJECT_TO_ORG),
-    ]
-
-    sample_size   = 0
-    phase_targets = {col: 0 for col in PHASE_FEATURES.values()}
-    target_total  = 0
-
-    for attempt_scope, fb_label in fallback_chain:
-        sample_size, phase_targets, target_total = _query_benchmark(
-            pipeline_name, project, attempt_scope, quantile
-        )
-        current_scope = attempt_scope
-        fallback_used = fb_label
-
-        # Stop if we have medium or better data quality
-        if _sufficiency(sample_size) != DataSufficiency.LOW:
-            break
-
-    # Completely unavailable
-    if sample_size == 0 or target_total == 0:
+    if baseline is None or sample_size < _MIN_BASELINE_RUNS:
+        logger.info("Benchmark disabled for run %d: %d comparable runs", run_id, sample_size)
         return BenchmarkOutput(
-            policy_used=policy,
-            scope_used=current_scope,
-            target_total_seconds=0,
-            total_opportunity_seconds=0,
-            total_opportunity_pct=0.0,
-            sample_size=0,
+            policy_used=BenchmarkPolicy.MEDIAN_SAME_STAGES,
+            scope_used=ComparisonScope.PIPELINE_FAMILY,
+            sample_size=sample_size,
             data_sufficiency=DataSufficiency.LOW,
             fallback_used=FallbackUsed.BENCHMARK_DISABLED,
+            observed_agent_seconds=observed_agent_seconds,
+            typical_agent_seconds=0,
             phases=[],
         )
 
-    # Per-phase opportunity
     phases: list[PhaseBenchmark] = []
-    for phase_label, col in PHASE_FEATURES.items():
-        observed = observed_features.get(col, 0)
-        target   = phase_targets.get(col, 0)
-        if target == 0:
+    for phase, column in AGENT_TIME_PHASES.items():
+        values   = baseline[column].astype(float)
+        observed = int(observed_features.get(column, 0))
+        typical  = int(round(values.median()))
+        p90      = int(round(values.quantile(0.9)))
+        if observed == typical == p90 == 0:
             continue
-        opportunity = max(0, observed - target)
         phases.append(PhaseBenchmark(
-            phase=phase_label,
+            phase=phase,
             observed_seconds=observed,
-            benchmark_seconds=target,
-            opportunity_seconds=opportunity,
+            typical_seconds=typical,
+            p90_seconds=p90,
+            above_typical_seconds=max(0, observed - typical),
         ))
 
-    total_opp = max(0, actual_duration - target_total)
-    opp_pct   = (
-        round(total_opp / actual_duration * 100, 1)
-        if actual_duration > 0 else 0.0
-    )
-
     return BenchmarkOutput(
-        policy_used=policy,
-        scope_used=current_scope,
-        target_total_seconds=target_total,
-        total_opportunity_seconds=total_opp,
-        total_opportunity_pct=opp_pct,
+        policy_used=BenchmarkPolicy.MEDIAN_SAME_STAGES,
+        scope_used=ComparisonScope.PIPELINE_FAMILY,
         sample_size=sample_size,
         data_sufficiency=_sufficiency(sample_size),
-        fallback_used=fallback_used,
+        fallback_used=FallbackUsed.NONE,
+        observed_agent_seconds=observed_agent_seconds,
+        typical_agent_seconds=int(round(baseline["total_timeline_seconds"].astype(float).median())),
         phases=phases,
     )

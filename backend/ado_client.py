@@ -199,50 +199,48 @@ def list_runs(
     top:         int = 50,
 ) -> list[dict]:
     """
-    Return the most recent runs for a pipeline.
+    Return the most recent runs for a pipeline, newest first.
+
+    Uses the Build API: the Pipelines runs list ignores $top and leaves the branch empty.
 
     Returns list of:
       {
         "id": int, "name": str, "state": str, "result": str | None,
         "created_date": str, "finished_date": str | None,
-        "duration_seconds": int | None
+        "duration_seconds": int | None, "branch": str | None
       }
     """
     headers = _get_ado_headers(user_token)
 
     with httpx.Client(timeout=15) as client:
         resp = client.get(
-            f"https://dev.azure.com/{org}/{project}/_apis/pipelines/{pipeline_id}/runs",
+            f"https://dev.azure.com/{org}/{project}/_apis/build/builds",
             headers=headers,
-            params={"api-version": _ADO_API_VERSION, "$top": top},
+            params={
+                "api-version": _ADO_API_VERSION,
+                "definitions": pipeline_id,
+                "queryOrder":  "queueTimeDescending",
+                "$top":        top,
+            },
         )
         resp.raise_for_status()
-        runs = resp.json().get("value", [])
+        builds = resp.json().get("value", [])
 
-    result = []
-    for r in runs:
-        created  = r.get("createdDate")
-        finished = r.get("finishedDate")
-        duration = None
-        if created and finished:
-            from datetime import datetime as _dt
-            try:
-                c = _dt.fromisoformat(created.replace("Z", "+00:00"))
-                f = _dt.fromisoformat(finished.replace("Z", "+00:00"))
-                duration = max(0, int((f - c).total_seconds()))
-            except Exception:
-                pass
-
-        result.append({
-            "id":               r["id"],
-            "name":             r.get("name", str(r["id"])),
-            "state":            r.get("state", ""),
-            "result":           r.get("result"),
-            "created_date":     created,
-            "finished_date":    finished,
-            "duration_seconds": duration,
-        })
-    return result
+    return [
+        {
+            "id":               b["id"],
+            "name":             b.get("buildNumber") or str(b["id"]),
+            "state":            b.get("status", ""),
+            "result":           b.get("result") if b.get("result") != "none" else None,
+            "created_date":     b.get("queueTime"),
+            "finished_date":    b.get("finishTime"),
+            "duration_seconds": (
+                _duration_seconds(b.get("queueTime"), b.get("finishTime")) if b.get("finishTime") else None
+            ),
+            "branch":           b.get("sourceBranch"),
+        }
+        for b in builds
+    ]
 
 
 def store_run_data(run_id: int, run_data: dict, timeline: list) -> None:

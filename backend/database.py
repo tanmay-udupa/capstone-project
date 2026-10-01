@@ -178,6 +178,28 @@ def update_analysis(
         conn.commit()
 
 
+def reset_analysis(analysis_id: int, requested_by: str, request_payload: dict) -> None:
+    """Return an existing analysis row to pending so it can be recomputed in place."""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE AnalysisResults
+            SET Status         = 'pending',
+                ResultJson     = NULL,
+                ErrorMessage   = NULL,
+                CompletedAt    = NULL,
+                StartedAt      = SYSUTCDATETIME(),
+                RequestedBy    = ?,
+                RequestPayload = ?
+            WHERE AnalysisId = ?
+            """,
+            requested_by,
+            json.dumps(request_payload),
+            analysis_id,
+        )
+        conn.commit()
+
+
 def get_analysis(analysis_id: int) -> dict | None:
     """Return analysis row as dict, or None if not found."""
     with get_conn() as conn:

@@ -78,7 +78,19 @@
         <p>No runs found for this pipeline</p>
       </div>
 
-      <table mat-table [dataSource]="runs" *ngIf="!loadingRuns && runs.length > 0" class="runs-table">
+      <div class="runs-toolbar" *ngIf="!loadingRuns && branches.length > 0">
+        <mat-form-field appearance="outline" class="branch-filter">
+          <mat-label>Branch</mat-label>
+          <mat-select [(ngModel)]="selectedBranch" (selectionChange)="applyBranchFilter()">
+            <mat-option value="">All branches ({{ runs.length }})</mat-option>
+            <mat-option *ngFor="let branch of branches" [value]="branch.name">
+              {{ branchLabel(branch.name) }} ({{ branch.count }})
+            </mat-option>
+          </mat-select>
+        </mat-form-field>
+      </div>
+
+      <table mat-table [dataSource]="filteredRuns" *ngIf="!loadingRuns && runs.length > 0" class="runs-table">
         <!-- ID -->
         <ng-container matColumnDef="id">
           <th mat-header-cell *matHeaderCellDef>Run ID</th>
@@ -89,6 +101,14 @@
         <ng-container matColumnDef="name">
           <th mat-header-cell *matHeaderCellDef>Name</th>
           <td mat-cell *matCellDef="let run" class="run-name">{{ run.name }}</td>
+        </ng-container>
+
+        <!-- Branch -->
+        <ng-container matColumnDef="branch">
+          <th mat-header-cell *matHeaderCellDef>Branch</th>
+          <td mat-cell *matCellDef="let run" class="run-branch" [title]="run.branch ?? ''">
+            {{ branchLabel(run.branch) }}
+          </td>
         </ng-container>
 
         <!-- State -->

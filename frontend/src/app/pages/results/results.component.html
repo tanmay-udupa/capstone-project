@@ -15,7 +15,7 @@
         <mat-spinner diameter="48"></mat-spinner>
         <h2>Analyzing Pipeline Run</h2>
         <p *ngIf="status === 'pending'">Queued — waiting for processing slot...</p>
-        <p *ngIf="status === 'running'">Running XGBoost inference and SHAP analysis...</p>
+        <p *ngIf="status === 'running'">Comparing this run with earlier runs of the same pipeline...</p>
         <mat-progress-bar mode="indeterminate" class="progress-bar"></mat-progress-bar>
         <div class="status-steps">
           <div class="step" [class.active]="status === 'pending' || status === 'running'">
@@ -23,10 +23,10 @@
           </div>
           <div class="step" [class.active]="status === 'running'">
             <mat-icon>{{ status === 'running' ? 'hourglass_top' : 'radio_button_unchecked' }}</mat-icon>
-            Running ML inference
+            Comparing with typical runs
           </div>
           <div class="step">
-            <mat-icon>radio_button_unchecked</mat-icon> Generating recommendations
+            <mat-icon>radio_button_unchecked</mat-icon> Writing findings
           </div>
         </div>
       </mat-card-content>
@@ -56,19 +56,95 @@
     <mat-card class="summary-card" appearance="outlined" *ngIf="result.decision_summary">
       <mat-card-content>
         <div class="summary-header">
-          <div class="summary-icon-container" [class]="getActionabilityClass(result.decision_summary.actionability)">
-            <mat-icon>
-              {{ result.decision_summary.actionability === 'high' ? 'rocket_launch' :
-                 result.decision_summary.actionability === 'medium' ? 'trending_up' : 'check_circle' }}
-            </mat-icon>
+          <div class="summary-icon-container info">
+            <mat-icon>insights</mat-icon>
           </div>
           <div class="summary-text">
             <h2>{{ result.decision_summary.message }}</h2>
-            <span class="status-chip" [class]="getActionabilityClass(result.decision_summary.actionability)">
-              {{ result.decision_summary.actionability }} actionability
-            </span>
           </div>
         </div>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- This run vs typical -->
+    <mat-card class="comparison-card" appearance="outlined" *ngIf="result.benchmark && result.run_metrics">
+      <mat-card-content>
+        <h2 class="card-title">This run compared with typical runs</h2>
+        <div class="metric-grid">
+          <div class="metric">
+            <span class="metric-label">Elapsed time</span>
+            <span class="metric-value">{{ formatMinutes(result.run_metrics.actual_duration_seconds) }}</span>
+            <span class="metric-detail">From queued to finished</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Agent time</span>
+            <span class="metric-value">{{ formatMinutes(result.benchmark.observed_agent_seconds) }}</span>
+            <span class="metric-detail">All jobs added up</span>
+          </div>
+          <ng-container *ngIf="hasBaseline">
+            <div class="metric">
+              <span class="metric-label">Typical agent time</span>
+              <span class="metric-value">{{ formatMinutes(result.benchmark.typical_agent_seconds) }}</span>
+              <span class="metric-detail">Median of {{ result.benchmark.sample_size }} runs with the same stages</span>
+            </div>
+            <div class="metric">
+              <span class="metric-label">Difference</span>
+              <span class="metric-value">
+                {{ agentTimeDifference >= 0 ? '+' : '−' }}{{ formatMinutes(agentTimeDifference) }}
+              </span>
+              <span class="metric-detail">
+                {{ agentTimeDifference >= 0 ? 'More' : 'Less' }} agent time than typical
+              </span>
+            </div>
+          </ng-container>
+        </div>
+        <p class="baseline-note" *ngIf="hasBaseline">
+          Typical is the median of up to 30 earlier runs of this pipeline that ran the same stages as this run and
+          succeeded or partially succeeded. Agent time adds up every job, including jobs that run at the same time,
+          so it can be larger than elapsed time.
+        </p>
+        <p class="baseline-note" *ngIf="!hasBaseline">
+          Not enough comparable runs: this needs at least 5 earlier runs of the same pipeline that ran the same
+          stages and succeeded or partially succeeded.
+        </p>
+      </mat-card-content>
+    </mat-card>
+
+    <!-- Agent time by phase -->
+    <mat-card class="phases-card" appearance="outlined" *ngIf="hasBaseline && result.phase_comparison?.length">
+      <mat-card-content>
+        <h2 class="card-title">Agent time by phase</h2>
+        <table class="phase-table">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th class="num">This run</th>
+              <th class="num">Typical</th>
+              <th class="num">Upper range</th>
+              <th class="num">Above typical</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let phase of result.phase_comparison">
+              <td>{{ phaseLabel(phase.phase) }}</td>
+              <td
+                class="num"
+                [class.above-typical]="phase.observed_seconds > phase.typical_seconds"
+                [class.above-p90]="phase.observed_seconds > phase.p90_seconds">
+                {{ formatMinutes(phase.observed_seconds) }}
+              </td>
+              <td class="num">{{ formatMinutes(phase.typical_seconds) }}</td>
+              <td class="num">{{ formatMinutes(phase.p90_seconds) }}</td>
+              <td class="num">
+                {{ phase.above_typical_seconds ? '+' + formatMinutes(phase.above_typical_seconds) : '–' }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="table-note">
+          Red: above the upper range, which 9 in 10 comparable runs stayed under. Orange: above typical but within
+          the usual range. Phases are matched by task name, so a task can count in more than one phase.
+        </p>
       </mat-card-content>
     </mat-card>
 
@@ -76,7 +152,7 @@
     <div class="recommendations-section" *ngIf="result.recommendations && result.recommendations.length > 0">
       <h2 class="section-title">
         <mat-icon>lightbulb</mat-icon>
-        Recommendations
+        Findings
       </h2>
 
       <div class="recommendations-list">
@@ -89,33 +165,23 @@
               <div class="rec-number">{{ i + 1 }}</div>
               <div class="rec-title-area">
                 <h3>{{ rec.title }}</h3>
-                <div class="rec-meta">
-                  <span class="status-chip" [class]="getPriorityClass(rec.priority)">
-                    {{ rec.priority }} priority
-                  </span>
-                  <span class="confidence-badge">
-                    {{ getConfidencePercent(rec.confidence) }}% confidence
-                  </span>
+                <div class="rec-meta" *ngIf="rec.observed_seconds !== null && rec.typical_seconds !== null">
+                  <span>This run: {{ formatMinutes(rec.observed_seconds) }}</span>
+                  <span>Typical: {{ formatMinutes(rec.typical_seconds) }}</span>
                 </div>
               </div>
-              <div class="rec-savings">
-                <span class="savings-value">{{ formatDuration(rec.estimated_savings_seconds) }}</span>
-                <span class="savings-label">potential savings</span>
-                <span class="savings-pct">{{ rec.estimated_savings_pct_of_run | number:'1.0-1' }}% of run</span>
+              <div class="rec-figure" *ngIf="rec.figure_seconds !== null">
+                <span class="figure-value">{{ formatMinutes(rec.figure_seconds) }}</span>
+                <span class="figure-label">{{ rec.figure_label }}</span>
+                <span class="figure-label" *ngIf="rec.share_of_agent_time_pct !== null">
+                  {{ rec.share_of_agent_time_pct | number: '1.0-0' }}% of this run's agent time
+                </span>
               </div>
             </div>
             <mat-divider></mat-divider>
             <p class="rec-description">{{ rec.description }}</p>
-            <div class="rec-footer">
-              <div class="rec-tags">
-                <span class="tag" *ngFor="let code of rec.reason_codes">{{ code }}</span>
-              </div>
-              <div class="savings-bar-container">
-                <div class="savings-bar-label">Phase impact: {{ rec.estimated_savings_pct_of_phase | number:'1.0-1' }}%</div>
-                <div class="savings-bar">
-                  <div class="savings-bar-fill" [style.width.%]="rec.estimated_savings_pct_of_phase"></div>
-                </div>
-              </div>
+            <div class="rec-tags">
+              <span class="tag" *ngFor="let code of rec.reason_codes">{{ code }}</span>
             </div>
           </mat-card-content>
         </mat-card>
@@ -126,9 +192,16 @@
     <mat-card class="empty-rec-card" appearance="outlined"
       *ngIf="result.recommendations && result.recommendations.length === 0">
       <mat-card-content>
-        <mat-icon>thumb_up</mat-icon>
-        <h3>No Optimization Opportunities</h3>
-        <p>This pipeline run is performing well. No significant improvements detected.</p>
+        <mat-icon>check_circle</mat-icon>
+        <h3>No findings for this run</h3>
+        <p *ngIf="hasBaseline">
+          No phase used more agent time than 9 in 10 comparable earlier runs, and no repeated tasks were large
+          enough to flag. Waste that happens in every run shows on the Pipeline Efficiency page.
+        </p>
+        <p *ngIf="!hasBaseline">
+          There aren't enough earlier runs with the same stages to compare phases yet, and no repeated tasks were
+          large enough to flag.
+        </p>
       </mat-card-content>
     </mat-card>
   </div>

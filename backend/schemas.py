@@ -9,11 +9,7 @@ from pydantic import BaseModel, Field
 # ── Enums ──────────────────────────────────────────────────────────────────────
 
 class BenchmarkPolicy(str, Enum):
-    FRONTIER_P10   = "frontier_p10"
-    FRONTIER_P20   = "frontier_p20"
-    PERCENTILE_P25 = "percentile_p25"
-    SLO_ONLY       = "slo_only"
-    HYBRID         = "hybrid_frontier_slo"
+    MEDIAN_SAME_STAGES = "median_same_stages"
 
 
 class ComparisonScope(str, Enum):
@@ -29,10 +25,8 @@ class DataSufficiency(str, Enum):
 
 
 class FallbackUsed(str, Enum):
-    NONE                = "none"
-    PIPELINE_TO_PROJECT = "pipeline_to_project"
-    PROJECT_TO_ORG      = "project_to_org"
-    BENCHMARK_DISABLED  = "benchmark_disabled"
+    NONE               = "none"
+    BENCHMARK_DISABLED = "benchmark_disabled"
 
 
 class AnalysisStatus(str, Enum):
@@ -42,31 +36,15 @@ class AnalysisStatus(str, Enum):
     FAILED   = "failed"
 
 
-class Actionability(str, Enum):
-    HIGH   = "high"
-    MEDIUM = "medium"
-    LOW    = "low"
-
-
-class Priority(str, Enum):
-    HIGH   = "high"
-    MEDIUM = "medium"
-    LOW    = "low"
-
-
 # ── Request ────────────────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    org:                     str            = Field(..., min_length=1, max_length=100)
-    project:                 str            = Field(..., min_length=1, max_length=100)
-    pipeline_id:             int            = Field(..., gt=0)
-    run_id:                  int            = Field(..., gt=0)
-    benchmark_policy:        BenchmarkPolicy  = BenchmarkPolicy.FRONTIER_P20
-    comparison_scope:        ComparisonScope  = ComparisonScope.PIPELINE_FAMILY
-    top_k_recommendations:   int            = Field(default=3,    ge=1, le=10)
-    min_confidence:          float          = Field(default=0.10, ge=0.0, le=1.0)
-    min_opportunity_seconds: int            = Field(default=60,   ge=0)
-    min_shap_impact_seconds: int            = Field(default=1,    ge=0)
+    org:                     str = Field(..., min_length=1, max_length=100)
+    project:                 str = Field(..., min_length=1, max_length=100)
+    pipeline_id:             int = Field(..., gt=0)
+    run_id:                  int = Field(..., gt=0)
+    top_k_recommendations:   int = Field(default=3,  ge=1, le=10)
+    min_opportunity_seconds: int = Field(default=60, ge=0)
 
 
 # ── Nested response objects ────────────────────────────────────────────────────
@@ -79,14 +57,13 @@ class RunMetrics(BaseModel):
 
 
 class BenchmarkResult(BaseModel):
-    policy_used:               BenchmarkPolicy
-    scope_used:                ComparisonScope
-    target_total_seconds:      int
-    total_opportunity_seconds: int
-    total_opportunity_pct:     float
-    sample_size:               int
-    data_sufficiency:          DataSufficiency
-    fallback_used:             FallbackUsed
+    policy_used:            BenchmarkPolicy
+    scope_used:             ComparisonScope
+    sample_size:            int
+    data_sufficiency:       DataSufficiency
+    fallback_used:          FallbackUsed
+    observed_agent_seconds: int   # task durations summed across every job in this run
+    typical_agent_seconds:  int   # median of the baseline runs
 
 
 class TopContributor(BaseModel):
@@ -100,29 +77,28 @@ class DiagnosisResult(BaseModel):
     top_contributors: list[TopContributor]
 
 
-class OpportunityByPhase(BaseModel):
-    phase:               str
-    observed_seconds:    int
-    benchmark_seconds:   int
-    opportunity_seconds: int
+class PhaseComparison(BaseModel):
+    phase:                 str
+    observed_seconds:      int
+    typical_seconds:       int
+    p90_seconds:           int
+    above_typical_seconds: int
 
 
 class Recommendation(BaseModel):
-    id:                        str
-    title:                     str
-    description:               str   # LLM-generated or template fallback
-    reason_codes:              list[str]
-    priority:                  Priority
-    confidence:                float
-    estimated_savings_seconds: int
-    estimated_savings_pct:     float  # Backward-compatible alias of pct_of_run
-    estimated_savings_pct_of_run: float
-    estimated_savings_pct_of_phase: float
+    id:                      str
+    title:                   str
+    description:             str   # LLM-generated or template fallback
+    reason_codes:            list[str]
+    figure_seconds:          int | None    # measured time behind the finding
+    figure_label:            str | None
+    share_of_agent_time_pct: float | None
+    observed_seconds:        int | None = None
+    typical_seconds:         int | None = None
 
 
 class DecisionSummary(BaseModel):
-    actionability: Actionability
-    message:       str
+    message: str
 
 
 class Versions(BaseModel):
@@ -159,10 +135,10 @@ class AnalysisResult(BaseModel):
     run_metrics:          RunMetrics | None      = None
     benchmark:            BenchmarkResult | None = None
     diagnosis:            DiagnosisResult | None = None
-    opportunity_by_phase: list[OpportunityByPhase] | None = None
-    recommendations:      list[Recommendation] | None     = None
-    decision_summary:     DecisionSummary | None          = None
-    versions:             Versions | None                 = None
+    phase_comparison:     list[PhaseComparison] | None = None
+    recommendations:      list[Recommendation] | None  = None
+    decision_summary:     DecisionSummary | None       = None
+    versions:             Versions | None              = None
 
 
 class RecommendationsOnly(BaseModel):
@@ -212,11 +188,12 @@ class AdoPipeline(BaseModel):
 class AdoRun(BaseModel):
     id:               int
     name:             str
-    state:            str          # inProgress | completed | canceling | unknown
+    state:            str          # Build API status: completed | inProgress | notStarted | cancelling | postponed
     result:           str | None   # succeeded | failed | canceled | partiallySucceeded
     created_date:     str | None
     finished_date:    str | None
     duration_seconds: int | None   # None when run is still in progress
+    branch:           str | None = None   # e.g. refs/heads/main
 
 
 class AdoOrganizationsResponse(BaseModel):
@@ -239,3 +216,100 @@ class AdoRunsResponse(BaseModel):
     project:     str
     pipeline_id: int
     runs:        list[AdoRun]
+
+
+# ── Insights (Pipeline Efficiency page) ────────────────────────────────────────
+
+class InsightsScope(BaseModel):
+    project:                   str | None
+    days:                      int | None
+    runs:                      int
+    pipelines:                 int
+    first_run_utc:             str | None
+    last_run_utc:              str | None
+    span_days:                 int
+    agent_seconds:             int
+    incomplete_before_utc:     str | None   # stored runs before this have gaps (insights.MIN_GAP_DAYS)
+    agent_seconds_per_30_days: int | None   # from runs since incomplete_before_utc; None if under 7 days
+
+
+class ComputeBreakdown(BaseModel):
+    name:          str
+    runs:          int
+    agent_seconds: int
+
+
+class RelatedRun(BaseModel):
+    run_id: int
+    result: str
+    url:    str | None
+
+
+class ExampleRun(BaseModel):
+    run_id:        int
+    pipeline:      str
+    started_utc:   str | None
+    agent_seconds: int
+    url:           str | None
+    related:       RelatedRun | None   # the other run of the same commit, for categories about pairs
+
+
+class FailedTaskCount(BaseModel):
+    pipeline: str
+    task:     str
+    runs:     int
+
+
+class WasteCategory(BaseModel):
+    key:              str
+    title:            str
+    runs:             int
+    agent_seconds:    int
+    likely_avoidable: bool
+    fix:              str
+    pipelines:        list[ComputeBreakdown]
+    examples:         list[ExampleRun]        # most agent time first
+    related_label:    str | None              # how each example relates to its related run, e.g. "Passed in"
+    failed_tasks:     list[FailedTaskCount]   # how many runs in this category the task failed in
+
+
+class PipelineCompute(BaseModel):
+    pipeline:                   str
+    runs:                       int
+    agent_seconds:              int
+    failed_or_canceled_seconds: int
+
+
+class TaskCompute(BaseModel):
+    pipeline:      str
+    task:          str
+    runs:          int
+    occurrences:   int
+    agent_seconds: int
+
+
+class RepeatedTask(BaseModel):
+    pipeline:          str
+    task:              str
+    runs:              int
+    extra_occurrences: int
+    repeated_seconds:  int
+
+
+class ProjectOption(BaseModel):
+    name: str
+    runs: int
+
+
+class InsightsProjectsResponse(BaseModel):
+    projects: list[ProjectOption]
+
+
+class InsightsResponse(BaseModel):
+    scope:          InsightsScope
+    by_outcome:     list[ComputeBreakdown]
+    by_pool:        list[ComputeBreakdown]
+    waste:          list[WasteCategory]
+    top_pipelines:  list[PipelineCompute]
+    top_tasks:      list[TaskCompute]
+    repeated_tasks: list[RepeatedTask]

@@ -165,6 +165,102 @@
   }
 }
 
+// Run vs typical and phase breakdown
+.comparison-card,
+.phases-card {
+  border-radius: 16px !important;
+  margin-bottom: 24px;
+
+  mat-card-content {
+    padding: 24px;
+  }
+}
+
+.card-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #1a1a2e;
+  margin-bottom: 16px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  .metric-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .metric-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #1a237e;
+  }
+
+  .metric-detail {
+    font-size: 0.85rem;
+    color: #666;
+  }
+}
+
+.baseline-note,
+.table-note {
+  font-size: 0.8rem;
+  color: #666;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+.phase-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+
+  th {
+    text-align: left;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #444;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 8px 12px;
+    border-bottom: 1px solid #e0e0e0;
+  }
+
+  td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #f0f0f0;
+    color: #333;
+  }
+
+  .num {
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .above-typical {
+    color: #e65100;
+    font-weight: 600;
+  }
+
+  .above-p90 {
+    color: #c62828;
+    font-weight: 700;
+  }
+}
+
 // Recommendations
 .recommendations-section {
   margin-top: 32px;
@@ -235,40 +331,32 @@
       display: flex;
       align-items: center;
       gap: 12px;
-    }
 
-    .confidence-badge {
-      font-size: 0.75rem;
-      color: #666;
-      font-weight: 500;
+      span {
+        font-size: 0.8rem;
+        color: #666;
+      }
     }
   }
 
-  .rec-savings {
+  .rec-figure {
     text-align: right;
     flex-shrink: 0;
+    max-width: 200px;
 
-    .savings-value {
+    .figure-value {
       display: block;
       font-size: 1.25rem;
       font-weight: 700;
-      color: #2e7d32;
+      color: #1a237e;
     }
 
-    .savings-label {
+    .figure-label {
       display: block;
       font-size: 0.7rem;
       color: #666;
       text-transform: uppercase;
       letter-spacing: 0.03em;
-    }
-
-    .savings-pct {
-      display: block;
-      font-size: 0.75rem;
-      color: #2e7d32;
-      font-weight: 500;
-      margin-top: 2px;
     }
   }
 
@@ -277,13 +365,6 @@
     color: #444;
     font-size: 0.9rem;
     line-height: 1.6;
-  }
-
-  .rec-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
   }
 
   .rec-tags {
@@ -298,31 +379,6 @@
       font-size: 0.72rem;
       color: #666;
       font-family: monospace;
-    }
-  }
-
-  .savings-bar-container {
-    flex: 0 0 180px;
-
-    .savings-bar-label {
-      font-size: 0.72rem;
-      color: #666;
-      margin-bottom: 4px;
-      text-align: right;
-    }
-
-    .savings-bar {
-      height: 6px;
-      background: #e0e0e0;
-      border-radius: 3px;
-      overflow: hidden;
-
-      .savings-bar-fill {
-        height: 100%;
-        background: linear-gradient(90deg, #2e7d32, #66bb6a);
-        border-radius: 3px;
-        transition: width 0.5s ease;
-      }
     }
   }
 }

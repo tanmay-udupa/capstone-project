@@ -5,10 +5,10 @@ import threading
 
 from config import settings
 from benchmark import BenchmarkOutput
-from feature_builder import PHASE_FEATURES
-from schemas import Actionability, DataSufficiency, Priority
 
 logger = logging.getLogger(__name__)
+
+RECOMMENDATION_RULES_VERSION = "3"
 
 _openai_client = None
 _openai_lock = threading.Lock()
@@ -30,95 +30,85 @@ def _get_openai_client():
 
 # ── Phase recommendation templates ────────────────────────────────────────────
 # (title, action_hint) — used both for the template fallback and LLM prompt context
+# Each hint cites the Azure Pipelines or vendor docs it was checked against on 2026-10-01.
 PHASE_TEMPLATES: dict[str, tuple[str, str]] = {
-    "queue": (
-        "Reduce queue wait time",
-        "Increase agent pool capacity, use self-hosted agents, or stagger pipeline triggers "
-        "to reduce concurrent demand. Check if the queue peak coincides with scheduled builds.",
-    ),
+    # Docs: "Pipeline caching"
     "restore": (
         "Speed up package restore",
-        "Enable pipeline caching for NuGet/npm packages keyed on the lockfile hash. "
-        "Consider switching to a private package feed with a closer network location.",
+        "If a Cache@2 step exists, check whether it missed in this run "
+        "(changed lockfile, or expired after 7 idle days). If there is none, add one keyed on "
+        "the lockfile hash (NuGet PackageReference: packages.lock.json plus NUGET_PACKAGES; "
+        "npm: cache npm_config_cache, not node_modules with npm ci). It only pays off when "
+        "restoring and saving the cache takes less time than downloading the packages.",
     ),
+    # Docs: "steps.checkout", "Publish and download pipeline artifacts"
     "download": (
-        "Reduce artifact download time",
-        "Cache large build artefacts between pipeline stages. "
-        "Evaluate whether all artefacts are required in every run.",
+        "Reduce checkout and download time",
+        "If the time is in checkout: use fetchDepth: 1 (unless the build needs history) with "
+        "fetchTags: false, because tags can still be synced on a shallow fetch; for large repos "
+        "add fetchFilter: blob:none or a sparse checkout; use checkout: none in jobs that only "
+        "need artifacts. If it is in artifact download: name the artifact, filter with patterns, "
+        "and add download: none to deployment jobs that don't need the automatic artifact download.",
     ),
+    # Docs: "Microsoft-hosted agents" (fresh VM per job)
     "build": (
         "Accelerate build / compile step",
-        "Enable incremental builds (only rebuild changed targets). "
-        "Consider distributing compilation across agents or using a build cache.",
+        "Check whether the same solution is built in several jobs or stages; build it once and "
+        "publish the output as a pipeline artifact. Incremental builds only help on self-hosted "
+        "agents that keep their workspace between runs.",
     ),
+    # Docs: "Use Test Impact Analysis", "Run VSTest tests in parallel"
     "test": (
         "Optimise test execution time",
-        "Parallelize test runs across multiple agents. "
-        "Identify and quarantine consistently slow or flaky tests. "
-        "Evaluate test impact analysis (run only tests affected by the change).",
+        "Fix or quarantine slow and flaky tests first: they and their retries are agent time you "
+        "can remove. Run tests in parallel inside each agent (framework parallelism or vstest "
+        "/parallel) before adding agents; extra agents mainly shorten elapsed time, not agent time. "
+        "Test Impact Analysis can skip unaffected tests, but only for VSTest v2 on managed "
+        "single-machine tests (not .NET Core, multi-machine setups, or non-VSTest runners such as "
+        "Jest or Cypress).",
     ),
+    # Docs: "Artifacts in Azure Pipelines", PublishBuildArtifacts@1
     "deploy": (
         "Speed up deploy / publish step",
-        "Parallelize independent deployment targets. "
-        "Use incremental or blue-green deployments to minimise per-release overhead.",
+        "If the time is in publishing artifacts: use Pipeline Artifacts (publish: or "
+        "PublishPipelineArtifact), which Microsoft recommends over Build Artifacts for faster "
+        "performance (not available in classic release pipelines), and add a .artifactignore "
+        "to leave out files nothing downstream needs. "
+        "If it is in deploy tasks: deploy only what changed, and run independent targets as "
+        "parallel jobs, which shortens elapsed time rather than agent time.",
     ),
+    # Black Duck Polaris and Coverity PR-scan docs (seen as search snippets only)
     "security_scan": (
         "Reduce security scan overhead",
-        "Run security scans on a schedule (e.g. nightly) rather than on every PR. "
-        "Scope scans to changed files only using incremental scanning options.",
+        "Use the scanner's pull-request or incremental mode on PRs (Polaris pull request scans, "
+        "Coverity desktop analysis of changed files) and keep the full scan for a schedule or "
+        "main; both rely on an earlier full scan as the baseline. Check any reduction in scan "
+        "frequency against your security and compliance requirements.",
     ),
+    # Docs: "Microsoft-hosted agents" (Networking, FAQ)
     "firewall": (
         "Minimise firewall rule overhead",
-        "Pre-provision stable firewall rules at provisioning time rather than per run. "
-        "Batch firewall rule changes when multiple pipelines share the same rule set.",
+        "Hosted-agent IP ranges change weekly and can't be listed by service tag, so a permanent "
+        "rule is only practical for agents with fixed addresses. Run the jobs that need the "
+        "allow-list on self-hosted, scale-set or Managed DevOps Pool agents, or group those steps "
+        "into fewer jobs so rules are opened, awaited and removed less often (each job can run on "
+        "a different agent IP).",
     ),
-}
-
-_SUFFICIENCY_WEIGHT: dict[DataSufficiency, float] = {
-    DataSufficiency.HIGH:   1.0,
-    DataSufficiency.MEDIUM: 0.8,
-    DataSufficiency.LOW:    0.5,
 }
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _compute_confidence(
-    shap_impact:      float,
-    opportunity:      float,
-    actual_duration:  int,
-    data_sufficiency: DataSufficiency,
-) -> float:
-    if actual_duration <= 0:
-        return 0.0
-    attribution_score  = min(1.0, abs(shap_impact) / actual_duration)
-    opportunity_score  = min(1.0, opportunity       / actual_duration)
-    raw_confidence     = attribution_score * 0.3 + opportunity_score * 0.7
-    weight             = _SUFFICIENCY_WEIGHT.get(data_sufficiency, 0.5)
-    confidence         = round(raw_confidence * weight, 4)
-    if opportunity_score >= 0.25 and confidence < 0.65:
-        confidence = 0.65   # ≥25% of run → HIGH
-    elif opportunity_score >= 0.15 and confidence < 0.40:
-        confidence = 0.40   # ≥15% of run → at least MEDIUM
-    return confidence
-
-
-def _priority(confidence: float) -> Priority:
-    if confidence >= 0.65:
-        return Priority.HIGH
-    if confidence >= 0.40:
-        return Priority.MEDIUM
-    return Priority.LOW
+def _share_pct(seconds: int, run_agent_seconds: int) -> float | None:
+    return round(seconds / run_agent_seconds * 100, 1) if run_agent_seconds > 0 else None
 
 
 def generate_narrative(
-    phase:              str,
-    observed_seconds:   int,
-    benchmark_seconds:  int,
-    opportunity_seconds:int,
-    shap_impact_seconds:float,
-    actual_duration:    int,
-    run_context:        dict,
+    phase:             str,
+    observed_seconds:  int,
+    typical_seconds:   int,
+    run_agent_seconds: int,
+    run_context:       dict,
 ) -> str:
     """
     Generate a plain-English recommendation narrative.
@@ -134,21 +124,18 @@ def generate_narrative(
     phase_task_context = run_context.get("phase_task_context") or {}
     phase_work_items = phase_task_context.get(phase) or []
     pipeline_name = run_context.get("pipeline_name") or "this pipeline"
+    baseline_runs = run_context.get("baseline_runs") or 0
 
-    opp_mins      = round(opportunity_seconds / 60, 1)
-    observed_mins = round(observed_seconds    / 60, 1)
-    bench_mins    = round(benchmark_seconds   / 60, 1)
-    opp_pct       = round(opportunity_seconds / actual_duration * 100, 1) if actual_duration > 0 else 0.0
-
-    # When benchmark is zero there is no historical baseline — phrase accordingly.
-    if benchmark_seconds == 0:
-        benchmark_clause = "no historical baseline available for comparison"
-    else:
-        benchmark_clause = f"{opp_mins} min above the benchmark ({bench_mins} min)"
+    above_seconds = max(0, observed_seconds - typical_seconds)
+    observed_mins = round(observed_seconds / 60, 1)
+    typical_mins  = round(typical_seconds  / 60, 1)
+    above_mins    = round(above_seconds    / 60, 1)
+    share_pct     = _share_pct(above_seconds, run_agent_seconds) or 0.0
 
     template_fallback = (
         f"{title}. "
-        f"This phase took {observed_mins} min — {benchmark_clause}. "
+        f"This phase used {observed_mins} agent-minutes in this run, summed across all jobs, "
+        f"against a typical {typical_mins} for {pipeline_name}: {above_mins} more than usual. "
         f"Suggested action: {action_hint}"
     )
 
@@ -174,29 +161,30 @@ def generate_narrative(
         system_prompt = (
             "You are a CI/CD pipeline performance analyst writing plain-English recommendations "
             "for software engineering teams. "
+            "Every duration you receive is agent time: task durations added up across all jobs in "
+            "the run, including jobs that ran at the same time. Agent time is not elapsed time.\n"
             "Write 3 to 4 sentences that follow this structure:\n"
-            "1. State the severity and impact: how long the phase took, how it compares to the benchmark, "
-            "and what percentage of the total run it represents.\n"
+            "1. State how much agent time this phase used in this run and how that compares with "
+            "the typical agent time for this phase in earlier runs of the same pipeline.\n"
             "2. Identify the specific bottleneck: if work items are listed, name at least one "
             "exact task title verbatim and state its duration. The duration shown next to each entry is "
             "the task duration, not the job or stage duration — do not attribute the task duration to the job or stage.\n"
             "3. Give one primary, immediately actionable step the team can take.\n"
-            "4. (Optional) Mention a secondary action or expected benefit if space allows.\n"
+            "4. (Optional) Mention a secondary action if space allows.\n"
             "Rules: plain prose only — no markdown, no bullet points, no numbered lists in the output. "
+            "Say 'agent time' or 'agent-minutes'; never call it elapsed time, run time, or pipeline duration. "
+            "Do not state what share of the pipeline's duration a phase takes, and do not promise time or cost savings. "
             "Do not invent task names, tools, or metrics not present in the input. "
-            "Do not use vague phrases like 'optimize performance' or 'improve efficiency'. "
-            "Calibrate confidence language to the data sufficiency level provided."
+            "Do not use vague phrases like 'optimize performance' or 'improve efficiency'."
         )
 
         user_prompt = (
             f"Pipeline: {pipeline_name}\n"
             f"Phase: {phase}\n"
-            f"Observed duration: {observed_mins} min\n"
-            f"Benchmark (target): {bench_mins} min" + (" (no historical baseline — first runs for this pipeline)" if benchmark_seconds == 0 else "") + "\n"
-            f"Opportunity (time to save): {opp_mins} min ({opp_pct}% of total run)\n"
-            f"Total run duration: {round(actual_duration / 60, 1)} min\n"
-            f"SHAP model attribution: {shap_impact_seconds:.0f}s\n"
-            f"Data sufficiency: {run_context.get('data_sufficiency', 'unknown')}\n"
+            f"Agent time for this phase in this run: {observed_mins} min\n"
+            f"Typical agent time for this phase: {typical_mins} min "
+            f"(median of {baseline_runs} earlier runs of this pipeline that ran the same stages)\n"
+            f"Above typical: {above_mins} min ({share_pct}% of this run's agent time)\n"
             f"{work_items_section}\n"
             f"Suggested action hint: {action_hint}"
         )
@@ -219,64 +207,45 @@ def generate_narrative(
 
 
 # ── Cross-cutting signal thresholds ──────────────────────────────────────────
-# These fire based on absolute feature values, independent of benchmark data.
-_DUPLICATE_TASK_THRESHOLD   = 3    # >= N duplicate task occurrences
-_SKIPPED_TASK_THRESHOLD     = 5    # >= N skipped tasks
-_QUEUE_WAIT_THRESHOLD_SEC   = 120  # >= 2 min queue wait
-_LOW_PARALLELISM_RATIO      = 0.6  # ratio < this with job_count > 2
+# These fire on absolute values from this run, independent of the baseline.
+_SKIPPED_TASK_THRESHOLD   = 5    # >= N skipped tasks
+_QUEUE_WAIT_THRESHOLD_SEC = 120  # >= 2 min queue wait
 
 
 def _build_cross_cutting_recommendations(
-    feature_values:  dict[str, float],
-    shap_by_feature: dict[str, float],
-    actual_duration: int,
-    run_context:     dict,
+    feature_values:      dict[str, float],
+    run_agent_seconds:   int,
+    run_context:         dict,
+    min_opportunity_sec: int,
 ) -> list[dict]:
     """
-    Generate recommendations from cross-cutting feature signals that are
-    independent of per-phase benchmark comparisons.
-
-    These fire on absolute thresholds (e.g. 5 duplicate tasks) and can
-    surface problems even when a pipeline has no benchmark history.
+    Generate recommendations from signals measured in this run that are
+    independent of the per-phase baseline, so they can surface problems
+    even when a pipeline has no history to compare with.
     """
     recs: list[dict] = []
     pipeline_name        = run_context.get("pipeline_name") or "this pipeline"
     cross_cutting_ctx    = run_context.get("cross_cutting_context") or {}
-    named_dup_tasks      = cross_cutting_ctx.get("duplicate_tasks") or []
+    named_repeated_tasks = cross_cutting_ctx.get("repeated_tasks") or []
     named_skipped_tasks  = cross_cutting_ctx.get("skipped_tasks")  or []
-
-    def _shap_secs(col: str) -> float:
-        return abs(shap_by_feature.get(col, 0.0))
 
     def _val(col: str) -> float:
         return float(feature_values.get(col, 0.0))
 
-    # 1. Duplicate tasks ───────────────────────────────────────────────────────
-    dup_count = int(_val("duplicate_task_occurrences"))
-    if dup_count >= _DUPLICATE_TASK_THRESHOLD:
-        shap_s = _shap_secs("duplicate_task_occurrences")
-        estimated_waste = min(int(shap_s), actual_duration) if shap_s > 0 else 0
+    # 1. Repeated tasks ────────────────────────────────────────────────────────
+    repeated_secs = int(cross_cutting_ctx.get("repeated_seconds") or 0)
+    if repeated_secs >= min_opportunity_sec:
+        repeated_mins = round(repeated_secs / 60, 1)
+        share_pct     = _share_pct(repeated_secs, run_agent_seconds)
+        action_hint   = (
+            "Cache restores (Cache@2), build once and publish a pipeline artifact, "
+            "and use checkout: none in jobs that only need artifacts."
+        )
 
-        shap_fraction = min(1.0, shap_s / actual_duration) if actual_duration > 0 else 0.0
-        count_signal  = min(1.0, dup_count / 20)           # saturates at 20 duplicates
-        confidence    = round(count_signal * 0.4 + shap_fraction * 0.6, 4)
-        if shap_fraction < 0.05 and confidence > 0.40:
-            confidence = 0.40
-
-        is_hygiene = shap_s < 60
-
+        narrative = ""
         if settings.LLM_ENABLED and settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY:
             try:
                 client = _get_openai_client()
-                hygiene_hint = (
-                    "The model attributes minimal direct duration savings to this pattern, "
-                    "so frame this as a maintainability and pipeline hygiene issue rather than a speed fix."
-                    if is_hygiene else ""
-                )
-                dup_task_list = (
-                    "Top duplicated tasks: " + ", ".join(named_dup_tasks)
-                    if named_dup_tasks else ""
-                )
                 response = client.chat.completions.create(
                     model=settings.AZURE_OPENAI_DEPLOYMENT,
                     messages=[{
@@ -284,21 +253,19 @@ def _build_cross_cutting_recommendations(
                         "content": (
                             "You are a CI/CD pipeline performance analyst. "
                             "Write 2 to 3 plain-prose sentences (no markdown, no bullets). "
-                            "Describe the problem with duplicate task runs and give one concrete action. "
-                            + hygiene_hint
+                            "Describe the repeated task executions and give one concrete action. "
+                            "Durations are agent time added up across jobs, not elapsed time; "
+                            "do not promise time or cost savings. Some repeats are by design "
+                            "(matrix builds, a checkout in every job), so tell the team to review them."
                         )
                     }, {
                         "role": "user",
                         "content": (
                             f"Pipeline: {pipeline_name}\n"
-                            f"Duplicate task occurrences: {dup_count} task rows appear more than once "
-                            f"across different jobs in this run\n"
-                            + (f"{dup_task_list}\n" if dup_task_list else "")
-                            + f"Model SHAP total attribution for this feature: {shap_s:.0f}s "
-                            f"(total predicted impact on run duration, not a per-occurrence figure)\n"
-                            f"Total run duration: {round(actual_duration / 60, 1)} min\n"
-                            "Action hint: Audit the YAML for tasks defined in multiple jobs that "
-                            "could be extracted to a shared template or run once with artefact passing."
+                            f"Agent time in repeated executions (every execution after the longest one "
+                            f"of the same task): {repeated_mins} min ({share_pct or 0.0}% of this run's agent time)\n"
+                            + (f"Largest repeated tasks: {', '.join(named_repeated_tasks)}\n" if named_repeated_tasks else "")
+                            + f"Action hint: {action_hint}"
                         )
                     }],
                     max_tokens=180,
@@ -306,48 +273,36 @@ def _build_cross_cutting_recommendations(
                 )
                 narrative = (response.choices[0].message.content or "").strip()
             except Exception as exc:
-                logger.warning("LLM failed for duplicate_tasks: %s", exc)
-                narrative = ""
-        else:
-            narrative = ""
+                logger.warning("LLM failed for repeated_tasks: %s", exc)
 
         if not narrative:
-            hygiene_note = (
-                " While direct duration savings are uncertain, reducing duplicates improves "
-                "pipeline maintainability and reduces unnecessary scheduling overhead."
-                if is_hygiene else ""
-            )
             task_detail = (
-                f" Top offenders: {', '.join(named_dup_tasks[:3])}."
-                if named_dup_tasks else ""
+                f" Largest: {', '.join(named_repeated_tasks[:3])}."
+                if named_repeated_tasks else ""
             )
             narrative = (
-                f"{dup_count} duplicate task occurrences detected in {pipeline_name} — "
-                "the same task names appear in multiple jobs within a single run."
-                + task_detail + hygiene_note + " "
-                "Audit the pipeline YAML for tasks defined in multiple jobs that could "
-                "be extracted to a shared template or run once with artefact passing."
+                f"Some tasks ran more than once in this run of {pipeline_name}, using {repeated_mins} "
+                "agent-minutes beyond the longest execution of each." + task_detail + " "
+                "Some repeats are by design (matrix builds, a checkout in every job), so review each one. "
+                f"Typical fixes: {action_hint}"
             )
 
         recs.append({
-            "phase":               "duplicate_tasks",
-            "title":              "Eliminate duplicate task runs",
-            "narrative":           narrative,
-            "shap_impact_seconds": round(shap_s, 1),
-            "opportunity_seconds": estimated_waste,
-            "confidence":          confidence,
-            "priority":            _priority(confidence).value,
-            "observed_seconds":    0,
-            "benchmark_seconds":   0,
+            "phase":                   "repeated_tasks",
+            "title":                   "Review tasks repeated across jobs",
+            "narrative":               narrative,
+            "figure_seconds":          repeated_secs,
+            "figure_label":            "agent time in repeated tasks",
+            "share_of_agent_time_pct": share_pct,
+            "observed_seconds":        None,
+            "typical_seconds":         None,
         })
-        logger.info("Cross-cutting: duplicate_tasks dup_count=%d confidence=%.3f", dup_count, confidence)
+        logger.info("Cross-cutting: repeated_tasks seconds=%d", repeated_secs)
 
     # 2. Skipped tasks ─────────────────────────────────────────────────────────
     skipped = int(_val("skipped_task_count"))
     if skipped >= _SKIPPED_TASK_THRESHOLD:
-        shap_s = _shap_secs("skipped_task_count")
-        confidence = round(min(1.0, skipped / 20) * 0.6, 4)
-
+        narrative = ""
         if settings.LLM_ENABLED and settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY:
             try:
                 client = _get_openai_client()
@@ -370,8 +325,7 @@ def _build_cross_cutting_recommendations(
                             f"Pipeline: {pipeline_name}\n"
                             f"Skipped task count: {skipped}\n"
                             + (f"{skipped_task_list}\n" if skipped_task_list else "")
-                            + f"Total run duration: {round(actual_duration / 60, 1)} min\n"
-                            "Action hint: Review pipeline conditions and triggers. Remove or consolidate "
+                            + "Action hint: Review pipeline conditions and triggers. Remove or consolidate "
                             "tasks that are consistently skipped to reduce scheduling noise and agent overhead."
                         )
                     }],
@@ -396,74 +350,38 @@ def _build_cross_cutting_recommendations(
             )
 
         recs.append({
-            "phase":               "skipped_tasks",
-            "title":              "Remove consistently skipped tasks",
-            "narrative":           narrative,
-            "shap_impact_seconds": round(shap_s, 1),
-            "opportunity_seconds": 0,
-            "confidence":          confidence,
-            "priority":            _priority(confidence).value,
-            "observed_seconds":    0,
-            "benchmark_seconds":   0,
+            "phase":                   "skipped_tasks",
+            "title":                   "Remove consistently skipped tasks",
+            "narrative":               narrative,
+            "figure_seconds":          None,
+            "figure_label":            None,
+            "share_of_agent_time_pct": None,
+            "observed_seconds":        None,
+            "typical_seconds":         None,
         })
-        logger.info("Cross-cutting: skipped_tasks count=%d confidence=%.3f", skipped, confidence)
+        logger.info("Cross-cutting: skipped_tasks count=%d", skipped)
 
-    # 3. Low parallelism ───────────────────────────────────────────────────────
-    job_count = int(_val("job_count"))
-    parallelism = _val("parallelism_ratio")
-    has_parallel = int(_val("has_parallel_execution"))
-    if job_count > 2 and parallelism < _LOW_PARALLELISM_RATIO and not has_parallel:
-        shap_s = _shap_secs("parallelism_ratio")
-        # Estimate: if parallelism ratio were 0.8, how much time would be saved
-        sequential_overhead = int(actual_duration * (0.8 - parallelism))
-        confidence = round(min(1.0, (0.8 - parallelism)) * 0.7, 4)
-
-        narrative = (
-            f"{pipeline_name} runs {job_count} jobs sequentially (parallelism ratio: "
-            f"{round(parallelism, 2)}), meaning jobs wait for each other to finish "
-            f"rather than running concurrently. Enabling parallel job execution in the "
-            f"pipeline YAML could reduce total run time by up to "
-            f"{round(sequential_overhead / 60, 1)} min. Review job dependencies and "
-            f"use \"dependsOn\" to run independent jobs simultaneously."
-        )
-        recs.append({
-            "phase":               "parallelism",
-            "title":              "Enable parallel job execution",
-            "narrative":           narrative,
-            "shap_impact_seconds": round(shap_s, 1),
-            "opportunity_seconds": sequential_overhead,
-            "confidence":          confidence,
-            "priority":            _priority(confidence).value,
-            "observed_seconds":    0,
-            "benchmark_seconds":   0,
-        })
-        logger.info("Cross-cutting: low_parallelism ratio=%.2f jobs=%d confidence=%.3f", parallelism, job_count, confidence)
-
-    # 4. High queue wait (absolute threshold, no benchmark needed) ─────────────
+    # 3. High queue wait (absolute threshold, no benchmark needed) ─────────────
     queue_secs = int(_val("queue_wait_seconds"))
     if queue_secs >= _QUEUE_WAIT_THRESHOLD_SEC:
-        shap_s = _shap_secs("queue_wait_seconds")
-        confidence = round(min(1.0, queue_secs / actual_duration) * 0.9, 4) if actual_duration > 0 else 0.0
         queue_mins = round(queue_secs / 60, 1)
         narrative = (
-            f"This run waited {queue_mins} min in the agent queue before execution began, "
-            f"accounting for {round(queue_secs / actual_duration * 100, 1)}% of total pipeline time. "
+            f"This run waited {queue_mins} min in the agent queue before any job started. "
             "High queue wait typically indicates agent pool saturation at peak hours. "
             "Consider increasing the agent pool size, using self-hosted agents, or staggering "
             "scheduled trigger times to spread load."
         )
         recs.append({
-            "phase":               "queue",
-            "title":              "Reduce agent queue wait time",
-            "narrative":           narrative,
-            "shap_impact_seconds": round(shap_s, 1),
-            "opportunity_seconds": queue_secs,
-            "confidence":          confidence,
-            "priority":            _priority(confidence).value,
-            "observed_seconds":    queue_secs,
-            "benchmark_seconds":   0,
+            "phase":                   "queue",
+            "title":                   "Reduce agent queue wait time",
+            "narrative":               narrative,
+            "figure_seconds":          queue_secs,
+            "figure_label":            "waiting for an agent",
+            "share_of_agent_time_pct": None,
+            "observed_seconds":        None,
+            "typical_seconds":         None,
         })
-        logger.info("Cross-cutting: high_queue_wait secs=%d confidence=%.3f", queue_secs, confidence)
+        logger.info("Cross-cutting: high_queue_wait secs=%d", queue_secs)
 
     return recs
 
@@ -471,197 +389,48 @@ def _build_cross_cutting_recommendations(
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def build_recommendations(
-    shap_by_feature:     dict[str, float],
     benchmark:           BenchmarkOutput,
-    actual_duration:     int,
     run_context:         dict,
-    feature_values:      dict[str, float] | None = None,
-    top_k:               int   = 3,
-    min_confidence:      float = 0.55,
-    min_opportunity_sec: int   = 60,
-    min_shap_impact_sec: int   = 20,
+    feature_values:      dict[str, float],
+    top_k:               int = 3,
+    min_opportunity_sec: int = 60,
 ) -> list[dict]:
     """
-    Build a ranked list of actionable recommendations.
+    Build findings from measured agent time, largest first.
 
-    Gate: recommendation is included ONLY if ALL THREE pass:
-      shap_impact  >= min_shap_impact_sec
-      opportunity  >= min_opportunity_sec
-      confidence   >= min_confidence
-
-    When no recommendations pass all gates, returns [] — callers must
-    handle the empty list and set actionability accordingly.
+    A phase is included only when this run used more agent time on it than 9 in 10
+    comparable earlier runs, and at least min_opportunity_sec more than typical.
+    Returns [] when nothing qualifies.
     """
-    candidates: list[dict] = []
+    run_agent_seconds = benchmark.observed_agent_seconds
+    recs: list[dict] = []
 
-    logger.info(
-        "Recommendation thresholds: min_confidence=%.2f, min_opportunity_sec=%d, "
-        "min_shap_impact_sec=%d, top_k=%d",
-        min_confidence,
-        min_opportunity_sec,
-        min_shap_impact_sec,
-        top_k,
-    )
-
-    phase_map = {pb.phase: pb for pb in benchmark.phases}
-
-    for phase, col in PHASE_FEATURES.items():
-        shap_impact  = shap_by_feature.get(col, 0.0)
-        phase_bench  = phase_map.get(phase)
-        opportunity  = phase_bench.opportunity_seconds if phase_bench else 0
-
-        confidence = _compute_confidence(
-            shap_impact, opportunity, actual_duration, benchmark.data_sufficiency
-        )
-
-        logger.info(
-            "Phase=%s metrics: shap_impact_seconds=%.1f, opportunity_seconds=%d, "
-            "confidence=%.3f",
-            phase,
-            shap_impact,
-            opportunity,
-            confidence,
-        )
-
-        # Gate 1 & 2: minimum absolute thresholds
-        if abs(shap_impact) < min_shap_impact_sec:
-            logger.info(
-                "Phase=%s rejected by SHAP gate: %.1f < %d",
-                phase,
-                abs(shap_impact),
-                min_shap_impact_sec,
-            )
+    for pb in benchmark.phases:
+        if not pb.is_unusual or pb.above_typical_seconds < min_opportunity_sec:
             continue
-        if opportunity < min_opportunity_sec:
-            logger.info(
-                "Phase=%s rejected by opportunity gate: %d < %d",
-                phase,
-                opportunity,
-                min_opportunity_sec,
-            )
-            continue
-
-        # Gate 3: confidence
-        if confidence < min_confidence:
-            logger.info(
-                "Phase=%s rejected by confidence gate: %.3f < %.3f",
-                phase,
-                confidence,
-                min_confidence,
-            )
-            continue
-
-        observed   = phase_bench.observed_seconds  if phase_bench else 0
-        bench_secs = phase_bench.benchmark_seconds if phase_bench else 0
-
-        narrative = generate_narrative(
-            phase=phase,
-            observed_seconds=observed,
-            benchmark_seconds=bench_secs,
-            opportunity_seconds=opportunity,
-            shap_impact_seconds=shap_impact,
-            actual_duration=actual_duration,
-            run_context=run_context,
-        )
-
-        candidates.append({
-            "phase":              phase,
-            "title":              PHASE_TEMPLATES.get(phase, ("Review phase", ""))[0],
-            "narrative":          narrative,
-            "shap_impact_seconds":round(shap_impact, 1),
-            "opportunity_seconds":opportunity,
-            "confidence":         confidence,
-            "priority":           _priority(confidence).value,
-            "observed_seconds":   observed,
-            "benchmark_seconds":  bench_secs,
+        recs.append({
+            "phase":                   pb.phase,
+            "title":                   PHASE_TEMPLATES.get(pb.phase, ("Review phase", ""))[0],
+            "narrative":               generate_narrative(
+                phase=pb.phase,
+                observed_seconds=pb.observed_seconds,
+                typical_seconds=pb.typical_seconds,
+                run_agent_seconds=run_agent_seconds,
+                run_context=run_context,
+            ),
+            "figure_seconds":          pb.above_typical_seconds,
+            "figure_label":            "agent time above typical",
+            "share_of_agent_time_pct": _share_pct(pb.above_typical_seconds, run_agent_seconds),
+            "observed_seconds":        pb.observed_seconds,
+            "typical_seconds":         pb.typical_seconds,
         })
         logger.info(
-            "Phase=%s accepted with confidence=%.3f and opportunity_seconds=%d",
-            phase,
-            confidence,
-            opportunity,
+            "Phase=%s flagged: observed=%d typical=%d p90=%d",
+            pb.phase, pb.observed_seconds, pb.typical_seconds, pb.p90_seconds,
         )
 
-    # Sort by confidence descending, then opportunity descending
-    candidates.sort(key=lambda r: (-r["confidence"], -r["opportunity_seconds"]))
-    if len(candidates) >= top_k:
-        return candidates[:top_k]
-
-    accepted_phases = {c["phase"] for c in candidates}
-    fallback_candidates = []
-
-    for phase, col in PHASE_FEATURES.items():
-        if phase in accepted_phases:
-            continue
-        phase_bench = phase_map.get(phase)
-        opportunity = phase_bench.opportunity_seconds if phase_bench else 0
-        if opportunity < min_opportunity_sec:
-            continue
-
-        shap_impact = shap_by_feature.get(col, 0.0)
-        confidence  = _compute_confidence(
-            shap_impact, opportunity, actual_duration, benchmark.data_sufficiency
-        )
-        observed   = phase_bench.observed_seconds  if phase_bench else 0
-        bench_secs = phase_bench.benchmark_seconds if phase_bench else 0
-
-        narrative = generate_narrative(
-            phase=phase,
-            observed_seconds=observed,
-            benchmark_seconds=bench_secs,
-            opportunity_seconds=opportunity,
-            shap_impact_seconds=shap_impact,
-            actual_duration=actual_duration,
-            run_context=run_context,
-        )
-        fallback_candidates.append({
-            "phase":              phase,
-            "title":              PHASE_TEMPLATES.get(phase, ("Review phase", ""))[0],
-            "narrative":          narrative,
-            "shap_impact_seconds":round(shap_impact, 1),
-            "opportunity_seconds":opportunity,
-            "confidence":         confidence,
-            "priority":           Priority.LOW.value,
-            "observed_seconds":   observed,
-            "benchmark_seconds":  bench_secs,
-        })
-        logger.info(
-            "Phase=%s added via opportunity fallback: opportunity_seconds=%d confidence=%.3f",
-            phase, opportunity, confidence,
-        )
-
-    fallback_candidates.sort(key=lambda r: -r["opportunity_seconds"])
-    needed = top_k - len(candidates)
-    phase_results = (candidates + fallback_candidates[:needed])[:top_k]
-
-    # ── Cross-cutting signals (redundancy, parallelism, queue) ──────────────────
-    # These fire on absolute thresholds regardless of benchmark availability.
-    # They are appended after phase results and the combined list is re-sorted
-    # and capped at top_k, so they only surface when they rank high enough.
-    cross_cutting: list[dict] = []
-    if feature_values:
-        accepted_phases = {r["phase"] for r in phase_results}
-        cross_cutting = [
-            r for r in _build_cross_cutting_recommendations(
-                feature_values, shap_by_feature, actual_duration, run_context
-            )
-            if r["phase"] not in accepted_phases  # don't duplicate queue if already in phase results
-        ]
-
-    combined = phase_results + cross_cutting
-    combined.sort(key=lambda r: (-r["confidence"], -r["opportunity_seconds"]))
-    return combined[:top_k]
-
-
-def compute_actionability(recommendations: list[dict]) -> Actionability:
-    """Map recommendation list to an overall actionability label."""
-    if not recommendations:
-        return Actionability.LOW
-    top_confidence   = recommendations[0]["confidence"]
-    any_high         = any(r["confidence"] >= 0.65 for r in recommendations)
-    total_saving_sec = sum(r.get("opportunity_seconds", 0) or 0 for r in recommendations)
-    if any_high or (top_confidence >= 0.40 and total_saving_sec >= 600):
-        return Actionability.HIGH
-    if top_confidence >= 0.40:
-        return Actionability.MEDIUM
-    return Actionability.LOW
+    recs.extend(_build_cross_cutting_recommendations(
+        feature_values, run_agent_seconds, run_context, min_opportunity_sec,
+    ))
+    recs.sort(key=lambda r: -(r["figure_seconds"] or 0))
+    return recs[:top_k]
